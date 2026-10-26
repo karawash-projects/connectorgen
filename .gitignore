@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+# local state written by the CLI (tokens, poll state, LLM cache)
+.connectorgen_tokens/
+.connectorgen_state/
+.connectorgen_cache/
+# working output from `connectorgen check`
+/repair/

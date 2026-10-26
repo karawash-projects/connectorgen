@@ -1,0 +1,30 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command or code you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: Spec or connector
+      description: >-
+        If a spec doesn't work, attach it or link to it (or the smallest part that still fails).
+        Please remove secrets first.
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Versions
+      placeholder: "connectorgen 0.9.0, Python 3.12, macOS 15"
+    validations:
+      required: true

@@ -1,0 +1,150 @@
+openapi: 3.0.3
+info:
+  title: Pet Store
+  version: "2.1.0"
+  description: Sample API exercising the cases connectorgen handles.
+servers:
+  - url: https://{region}.api.petstore.test/v1
+    variables:
+      region:
+        default: us
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    BearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    PetId:
+      name: petId
+      in: path
+      required: true
+      schema: { type: integer }
+  schemas:
+    Pet:
+      type: object
+      required: [name]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        tag: { type: string, nullable: true }
+    Category:
+      type: object
+      properties:
+        name: { type: string }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/Category" }
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      summary: List pets
+      tags: [pets]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, maximum: 100 } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [available, sold] } }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Pet" }
+                  meta:
+                    type: object
+                    properties:
+                      next_cursor: { type: string, nullable: true }
+    post:
+      operationId: createPet
+      summary: Create a pet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Pet" }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pet" }
+  /pets/{petId}:
+    parameters:
+      - $ref: "#/components/parameters/PetId"
+    get:
+      operationId: getPet
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pet" }
+    delete:
+      operationId: deletePet
+      responses:
+        "204": { description: deleted }
+  /orders:
+    get:
+      summary: List orders (offset pagination, bare array)
+      parameters:
+        - { name: offset, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object }
+  /customers:
+    get:
+      operationId: listCustomers
+      parameters:
+        - { name: limit, in: query, schema: { type: integer } }
+        - { name: starting_after, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { type: object } }
+                  has_more: { type: boolean }
+  /categories:
+    get:
+      operationId: listCategories
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Category" }
+  /events:
+    get:
+      operationId: listEvents
+      parameters:
+        - { name: page_token, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events: { type: array, items: { type: object } }
+                  next: { type: string }
