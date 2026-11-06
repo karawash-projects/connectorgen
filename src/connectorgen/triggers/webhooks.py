@@ -86,6 +86,7 @@ def parse_webhook(
     seen_ids: MutableSet[str] | None = None,
     validate: Literal["off", "warn", "raise"] = "warn",
     now: float | None = None,
+    allow_unsigned: bool = False,
 ) -> Any:
     """Verify and decode one delivery. Pass the raw request body bytes, exactly as
     received; re-serialized JSON will not match the signature.
@@ -93,10 +94,23 @@ def parse_webhook(
     seen_ids: the delivery id is added only once the delivery has passed every check
     (signature, JSON, schema), so a sender's retry after a rejected delivery isn't
     mistaken for a duplicate. If your own processing then fails, `seen_ids.discard(id)`
-    so the retry is accepted."""
+    so the retry is accepted.
+
+    A trigger without `signature` can't be verified, so anyone who can reach your endpoint
+    could send it deliveries. That fails closed: set the trigger's `signature`, or pass
+    allow_unsigned=True if the sender really doesn't sign (and you don't pass a secret)."""
     if trigger.kind != "webhook":
         raise WebhookError(f"Trigger '{trigger.name}' is not a webhook trigger.")
-    if trigger.signature is not None:
+    if trigger.signature is None:
+        if secret:
+            raise WebhookError(
+                f"Trigger '{trigger.name}' has no signature settings, so the secret can't be "
+                "checked. Set trigger.signature (e.g. a GitHub or Stripe preset).")
+        if not allow_unsigned:
+            raise WebhookError(
+                f"Trigger '{trigger.name}' has no signature settings, so deliveries can't be "
+                "verified. Set trigger.signature, or pass allow_unsigned=True to accept them anyway.")
+    else:
         if not secret:
             raise WebhookError(f"Trigger '{trigger.name}' requires a signing secret.")
         verify_signature(secret, body, headers, trigger.signature, now=now)

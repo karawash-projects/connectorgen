@@ -250,9 +250,10 @@ def test_webhook_payload_validation(tracker):
     trigger = next(t for t in tracker.triggers if t.name == "on_issue_created")
     bad = json.dumps({"action": "created"}).encode()
     with pytest.raises(WebhookError, match="'issue' is a required property"):
-        parse_webhook(trigger, {}, bad, schemas=tracker.schemas, validate="raise")
+        parse_webhook(trigger, {}, bad, schemas=tracker.schemas, validate="raise", allow_unsigned=True)
     with pytest.warns(UserWarning):
-        assert parse_webhook(trigger, {}, bad, schemas=tracker.schemas) == {"action": "created"}
+        assert parse_webhook(trigger, {}, bad, schemas=tracker.schemas,
+                             allow_unsigned=True) == {"action": "created"}
 
 
 def test_trigger_roundtrips_through_json(tracker, tmp_path):

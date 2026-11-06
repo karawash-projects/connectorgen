@@ -12,6 +12,7 @@ import contextvars
 import functools
 import json
 import re
+import time
 from typing import Any
 
 from jsonschema import Draft202012Validator, validators
@@ -51,7 +52,7 @@ def _size(instance: Any, cap: int = 10_000_000) -> int:
     return n
 
 
-_budget: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("validation_budget", default=None)
+_budget: contextvars.ContextVar[list[Any] | None] = contextvars.ContextVar("validation_budget", default=None)
 
 
 def _counted(fn: Any) -> Any:
@@ -72,11 +73,53 @@ def _counted(fn: Any) -> Any:
 # every pair. Inside a bounded validation, regexes run on the `regex` engine with a timeout,
 # and uniqueItems / enum use hashing (keeping JSON Schema equality: 1 == 1.0, 1 != true).
 
-REGEX_TIMEOUT = 0.25  # seconds per match
+REGEX_TIMEOUT = 0.25        # seconds per match
+REGEX_TOTAL_SECONDS = 1.0   # seconds of regex matching per validation (patterns run per value)
+
+
+MAX_REGEX_EXPANSION = 50_000  # the regex engine unrolls counted repeats when compiling
+
+
+def _regex_expansion(pattern: str) -> int:
+    """Roughly how many nodes compiling `pattern` unrolls to: counted repeats multiply
+    ((a{1000}){1000}){1000} is a billion), so it's measured on the cheap stdlib parse first."""
+    try:
+        from re import _constants as C
+        from re import _parser as P
+    except ImportError:  # pragma: no cover - Python 3.10
+        import sre_constants as C  # type: ignore[no-redef]
+        import sre_parse as P  # type: ignore[no-redef]
+    repeats = {C.MAX_REPEAT, C.MIN_REPEAT, getattr(C, "POSSESSIVE_REPEAT", None)}
+
+    def size(items: Any) -> int:
+        total = 0
+        for op, av in items:
+            if op in repeats:
+                lo, hi, sub = av
+                times = hi if hi != C.MAXREPEAT else max(lo, 1)
+                total += max(times, 1) * size(sub)
+            elif op == C.SUBPATTERN:
+                total += size(av[-1])
+            elif op == C.BRANCH:
+                total += sum(size(b) for b in av[1])
+            elif op in (C.ASSERT, C.ASSERT_NOT):
+                total += size(av[1])
+            elif op == getattr(C, "ATOMIC_GROUP", None):
+                total += size(av)
+            else:
+                total += 1
+            if total > MAX_REGEX_EXPANSION:
+                return total
+        return total
+
+    try:
+        return size(P.parse(pattern))
+    except Exception:  # noqa: BLE001 - not a stdlib-parsable regex: let the engine decide
+        return 0
 
 
 @functools.lru_cache(maxsize=4096)
-def _compile(pattern: str) -> Any:
+def _compile_cached(pattern: str) -> Any:
     import regex
 
     try:
@@ -85,14 +128,38 @@ def _compile(pattern: str) -> Any:
         return None
 
 
+def _compile(pattern: str) -> Any:
+    """The compiled pattern, or None if it isn't a valid regex. SchemaTooLarge if compiling
+    it would take unreasonable memory."""
+    if _regex_expansion(pattern) > MAX_REGEX_EXPANSION:
+        raise SchemaTooLarge(f"the regex {pattern[:60]!r} is too large to compile")
+    return _compile_cached(pattern)
+
+
 def _bounded_search(pattern: Any, string: str, flags: int = 0) -> Any:
     compiled = _compile(pattern) if isinstance(pattern, str) and not flags else None
     if compiled is None:
+        if isinstance(pattern, str) and not flags:
+            try:
+                re.compile(pattern)
+            except re.error:
+                return re.search(pattern, string, flags)  # invalid everywhere: re reports it
+            # Valid for the standard library but not the bounded engine: matching it with
+            # the standard library would have no time limit, so don't.
+            raise SchemaTooLarge(f"the regex {pattern[:60]!r} can't be checked with a time limit")
         return re.search(pattern, string, flags)
+    budget = _budget.get()
+    remaining = budget[2] if budget is not None and len(budget) > 2 else REGEX_TOTAL_SECONDS
+    if remaining <= 0:
+        raise SchemaTooLarge("regex patterns took too long to check in total")
+    started = time.perf_counter()
     try:
-        return compiled.search(string, timeout=REGEX_TIMEOUT)
+        return compiled.search(string, timeout=min(REGEX_TIMEOUT, remaining))
     except TimeoutError:
         raise SchemaTooLarge(f"the regex {pattern[:60]!r} takes too long to match") from None
+    finally:
+        if budget is not None and len(budget) > 2:
+            budget[2] -= time.perf_counter() - started
 
 
 class _ReShim:
@@ -185,7 +252,7 @@ class BoundedValidator:
 
     def _run(self, instance: Any, consume: Any) -> Any:
         steps = self.base_steps + VALIDATION_STEPS_PER_VALUE * _size(instance)
-        token = _budget.set([steps, steps])
+        token = _budget.set([steps, steps, REGEX_TOTAL_SECONDS])
         try:
             return consume(self._validator.iter_errors(instance))
         finally:

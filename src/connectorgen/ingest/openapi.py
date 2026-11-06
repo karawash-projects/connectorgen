@@ -104,7 +104,8 @@ def _configure(cls: Any, base: Any) -> None:
                     "tag:yaml.org,2002:null"):
                 key_node.tag = "tag:yaml.org,2002:str"
         # Merge keys (`<<: *anchor`) copy every key of the anchor into this mapping while it's
-        # built, so a small file can expand to gigabytes; count entries as they're made.
+        # built, so a small file can expand to gigabytes. flatten_mapping (below) counts the
+        # expanded size before copying anything; count the built entries too.
         if hasattr(self, "flatten_mapping"):
             self.flatten_mapping(node)
         self._built_entries = getattr(self, "_built_entries", 0) + len(node.value)
@@ -114,8 +115,42 @@ def _configure(cls: Any, base: Any) -> None:
                 "keys that fan out); refusing to load it.")
         return base.construct_mapping(self, node, deep=deep)
 
+    def flatten_mapping(self: Any, node: Any) -> None:
+        # Measure what merging would produce, memoized per node so even deeply nested merges
+        # are cheap to measure, and refuse before PyYAML copies anything.
+        memo = self.__dict__.setdefault("_merge_sizes", {})
+        self._merged_entries = getattr(self, "_merged_entries", 0) + _merged_size(node, memo)
+        if self._merged_entries > MAX_SPEC_NODES:
+            raise UnsupportedSpecError(
+                f"Spec expands to more than {MAX_SPEC_NODES:,} values (YAML merge keys that fan "
+                "out); refusing to load it.")
+        base.flatten_mapping(self, node)
+
     cls.construct_mapping = construct_mapping
+    cls.flatten_mapping = flatten_mapping
     cls.add_multi_constructor("", _plain)
+
+
+def _merged_size(node: Any, memo: dict[int, int], depth: int = 0) -> int:
+    """Entries a mapping node has once its `<<` merge keys are expanded (PyYAML copies the
+    merged entries into it). Memoized: shared anchors are measured once."""
+    if not isinstance(node, yaml.MappingNode):
+        return 0
+    key = id(node)
+    if key in memo:
+        return memo[key]
+    if depth > MAX_SPEC_DEPTH:
+        raise UnsupportedSpecError(f"Spec is nested more than {MAX_SPEC_DEPTH} levels deep.")
+    memo[key] = 0  # cycles (an anchor merging itself) count once
+    total = 0
+    for key_node, value_node in node.value:
+        if getattr(key_node, "tag", None) == "tag:yaml.org,2002:merge":
+            subs = value_node.value if isinstance(value_node, yaml.SequenceNode) else [value_node]
+            total += sum(_merged_size(sub, memo, depth + 1) for sub in subs)
+        else:
+            total += 1
+    memo[key] = total
+    return total
 
 
 _configure(_SpecLoader, _Base)
@@ -210,15 +245,50 @@ def _parse(text: str) -> Any:
         raise UnsupportedSpecError(f"Spec isn't valid JSON or YAML{where}: {problem}") from None
 
 
+MAX_SPEC_REDIRECTS = 5
+
+
 def fetch_spec_text(url: str, *, max_bytes: int | None = None,
-                    timeout: float = SPEC_FETCH_TIMEOUT) -> str:
-    """Download a spec with a size cap and an overall deadline (not just per-read)."""
+                    timeout: float = SPEC_FETCH_TIMEOUT, allow_private: bool | None = None,
+                    http: httpx.Client | None = None) -> str:
+    """Download a spec with a size cap and an overall deadline (not just per-read).
+
+    Redirects are followed by hand: never from https to http, and never to a private,
+    loopback or link-local address (an internal service or a cloud metadata endpoint),
+    unless the URL you gave is itself on one (a spec served locally, say).
+    allow_private=False refuses private addresses even for the URL you gave, for apps
+    that fetch URLs their users supply; True allows them everywhere.
+    http: your own client (proxies, extra limits); redirects are still checked here."""
     import time
+
+    from ..runtime.urls import private_address
 
     limit = max_bytes or MAX_SPEC_BYTES
     deadline = time.monotonic() + timeout
+    first_private = private_address(url)
+    if allow_private is False and first_private:
+        raise UnsupportedSpecError(f"Refusing to fetch {url}: it's a private or local address.")
+    private_ok = allow_private is True or (allow_private is None and first_private)
+    client = http or httpx.Client(timeout=min(60.0, timeout))
     try:
-        with httpx.stream("GET", url, follow_redirects=True, timeout=min(60.0, timeout)) as resp:
+        current = url
+        for _ in range(MAX_SPEC_REDIRECTS + 1):
+            resp = client.send(client.build_request("GET", current), stream=True,
+                               follow_redirects=False)
+            location = resp.headers.get("location")
+            if resp.status_code not in (301, 302, 303, 307, 308) or not location:
+                break
+            resp.close()
+            target = str(httpx.URL(current).join(location))
+            if current.startswith("https://") and not target.startswith("https://"):
+                raise UnsupportedSpecError(f"Refusing a redirect from https to {target.split(':')[0]}.")
+            if not private_ok and private_address(target):
+                raise UnsupportedSpecError(
+                    "Refusing a redirect to a private or local address while fetching the spec.")
+            current = target
+        else:
+            raise UnsupportedSpecError(f"Too many redirects fetching {url}.")
+        try:
             resp.raise_for_status()
             declared = resp.headers.get("content-length", "")
             if declared.isdigit() and int(declared) > limit:
@@ -232,8 +302,13 @@ def fetch_spec_text(url: str, *, max_bytes: int | None = None,
                     raise UnsupportedSpecError(f"Downloading {url} took longer than {timeout:.0f}s.")
                 chunks.append(chunk)
             return b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+        finally:
+            resp.close()
     except httpx.HTTPError as e:
         raise UnsupportedSpecError(f"Couldn't download {url}: {type(e).__name__}: {e}") from None
+    finally:
+        if http is None:
+            client.close()
 
 
 def load_spec(source: str | Path) -> dict[str, Any]:

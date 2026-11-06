@@ -62,5 +62,7 @@ checked against a 5-minute replay window. Repeat deliveries raise `DuplicateDeli
 payloads are checked against the schema (warn by default). A delivery id is recorded only once
 the delivery passes every check, so the sender's retry after a rejection is accepted. Specs
 rarely say how webhooks are signed, so `signature` is set by you; presets cover GitHub and Stripe.
+A trigger without `signature` is refused, since anyone who can reach your endpoint could send
+it deliveries; pass `allow_unsigned=True` only for senders that really don't sign.
 
 [← Back to the README](../README.md)

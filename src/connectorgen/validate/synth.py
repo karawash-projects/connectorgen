@@ -149,6 +149,10 @@ class Synthesizer:
             if depth >= self.max_depth:
                 return []
             count = max(1, int(schema.get("minItems", 1)))
+            if count > MAX_EXAMPLE_ITEMS:
+                from ..limits import SchemaTooLarge
+
+                raise SchemaTooLarge(f"an example would need at least {count:,} items")
             if "maxItems" in schema:
                 count = min(count, int(schema["maxItems"]))
             item = self._value(schema.get("items", {}), depth + 1, name, seen)
@@ -245,13 +249,17 @@ class Synthesizer:
                 value = _FORMAT_EXAMPLES["uri"]
         min_len = int(schema.get("minLength", 0))
         max_len = schema.get("maxLength")
+        if min_len > MAX_EXAMPLE_LENGTH:
+            from ..limits import SchemaTooLarge
+
+            raise SchemaTooLarge(f"an example string would need at least {min_len:,} characters")
         if len(value) < min_len:
             value = value + "x" * (min_len - len(value))
         if max_len is not None and len(value) > int(max_len):
             value = value[: int(max_len)] or ""
         pattern = schema.get("pattern")
         if pattern and not _search(pattern, value):
-            generated = regex_example(pattern)
+            generated = regex_example(pattern, min_length=min_len)
             if generated is not None:
                 value = generated
         return value
@@ -278,11 +286,23 @@ def _fits(value: Any, schema: dict[str, Any]) -> bool:
     return False
 
 
+# Example values stay small: a schema that needs a huge one is skipped, not built.
+MAX_EXAMPLE_LENGTH = 10_000
+MAX_EXAMPLE_ITEMS = 1_000
+
+
 def _search(pattern: str, value: str) -> bool:
+    """Bounded: a spec's pattern can backtrack catastrophically ((x+x+)+y), so it runs on the
+    regex engine with a time limit (SchemaTooLarge when exceeded)."""
+    from ..limits import REGEX_TIMEOUT, SchemaTooLarge, _compile
+
+    compiled = _compile(pattern)
+    if compiled is None:
+        return True  # not a regex this engine understands; don't fight it
     try:
-        return re.search(pattern, value) is not None
-    except re.error:
-        return True  # not a Python-compatible regex; don't fight it
+        return compiled.search(value, timeout=REGEX_TIMEOUT) is not None
+    except TimeoutError:
+        raise SchemaTooLarge(f"the regex {pattern[:60]!r} takes too long to match") from None
 
 
 try:  # Python 3.11+
@@ -297,18 +317,24 @@ class _Unsupported(Exception):
     pass
 
 
-def regex_example(pattern: str) -> str | None:
+def regex_example(pattern: str, *, min_length: int = 0) -> str | None:
     """A short string matching `pattern`, for the regex subset APIs actually use:
-    literals, classes, ranges, quantifiers, groups, alternation, anchors."""
+    literals, classes, ranges, quantifiers, groups, alternation, anchors. With min_length,
+    the first open-ended repeat is stretched to reach it."""
     try:
         parsed = _sre_parse.parse(pattern)
         value = _gen(parsed)
-    except (re.error, _Unsupported, RecursionError, ValueError, TypeError):
+        if len(value) < min_length:
+            value = _gen(parsed, [min_length - len(value)])
+    except (re.error, _Unsupported, RecursionError, ValueError, TypeError, OverflowError):
+        return None
+    if len(value) < min_length:
         return None
     return value if _search(pattern, value) else None
 
 
-def _gen(items: Any) -> str:
+def _gen(items: Any, stretch: list[int] | None = None) -> str:
+    """stretch: [characters still needed]; the first repeat that can grow absorbs them."""
     out = []
     for op, av in items:
         if op == _C.LITERAL:
@@ -322,13 +348,20 @@ def _gen(items: Any) -> str:
         elif op in (_C.MAX_REPEAT, _C.MIN_REPEAT, getattr(_C, "POSSESSIVE_REPEAT", None)):
             lo, hi, sub = av
             count = max(lo, min(1, hi))
-            out.append("".join(_gen(sub) for _ in range(count)))
+            piece = _gen(sub, stretch)
+            if stretch and stretch[0] > 0 and piece and hi > count:
+                extra = min(hi - count, -(-stretch[0] // len(piece)))
+                count += extra
+                stretch[0] -= extra * len(piece)
+            if len(piece) * count > MAX_EXAMPLE_LENGTH:
+                raise _Unsupported("example would be too long")
+            out.append(piece * count)
         elif op == _C.SUBPATTERN:
-            out.append(_gen(av[-1]))
+            out.append(_gen(av[-1], stretch))
         elif op == getattr(_C, "ATOMIC_GROUP", None):
-            out.append(_gen(av))
+            out.append(_gen(av, stretch))
         elif op == _C.BRANCH:
-            out.append(_gen(av[1][0]))
+            out.append(_gen(av[1][0], stretch))
         elif op in (_C.AT, _C.ASSERT, _C.ASSERT_NOT):
             continue  # anchors / lookarounds: generate nothing, let the final check decide
         else:

@@ -321,3 +321,108 @@ def test_l3_save_is_atomic_and_keeps_permissions(tmp_path):
     c.save(path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert [p.name for p in tmp_path.iterdir()] == ["c.json"]   # no temp files left behind
+
+
+# -- step 2: untrusted input ---------------------------------------------------------------------
+
+from connectorgen import UnsupportedSpecError  # noqa: E402
+from connectorgen.ingest.openapi import fetch_spec_text, parse_spec_text  # noqa: E402
+from connectorgen.ir import Trigger, WebhookSignature  # noqa: E402
+from connectorgen.limits import BoundedValidator, SchemaTooLarge  # noqa: E402
+from connectorgen.triggers.webhooks import WebhookError, parse_webhook  # noqa: E402
+from connectorgen.validate.synth import Synthesizer, regex_example  # noqa: E402
+
+
+def test_h2_unsigned_webhooks_fail_closed():
+    trig = Trigger(name="evt", kind="webhook")
+    with pytest.raises(WebhookError, match="can't be checked"):
+        parse_webhook(trig, {}, b'{"evil": 1}', secret="s3cret")
+    with pytest.raises(WebhookError, match="allow_unsigned"):
+        parse_webhook(trig, {}, b'{"evil": 1}')
+    assert parse_webhook(trig, {}, b'{"ok": 1}', allow_unsigned=True) == {"ok": 1}
+    signed = Trigger(name="evt", kind="webhook", signature=WebhookSignature.github())
+    with pytest.raises(WebhookError):
+        parse_webhook(signed, {}, b'{"evil": 1}', secret="s3cret")
+
+
+def test_h3_nested_merge_keys_are_measured_before_expanding(monkeypatch):
+    import connectorgen.ingest.openapi as openapi_mod
+    monkeypatch.setattr(openapi_mod, "MAX_SPEC_NODES", 100_000)
+    lines = ['openapi: "3.0.0"', 'info: {title: t, version: "1"}', "paths: {}",
+             "a0: &a0 {" + ", ".join(f"k{i}: 1" for i in range(10)) + "}"]
+    for level in range(1, 9):  # each level merges the previous one ten times over
+        lines.append(f"a{level}: &a{level} [" + ", ".join(f"{{<<: *a{level - 1}, x{j}: 1}}" for j in range(10)) + "]")
+    with pytest.raises(UnsupportedSpecError, match="expands to more than"):
+        parse_spec_text("\n".join(lines))
+
+
+def test_h3_ordinary_merge_keys_still_work():
+    text = 'openapi: "3.0.0"\ninfo: {title: t, version: "1"}\npaths: {}\nbase: &b {a: 1, b: 2}\nx: {<<: *b, c: 3}\n'
+    assert parse_spec_text(text)["x"] == {"a": 1, "b": 2, "c": 3}
+
+
+@respx.mock
+def test_h4_spec_redirects_never_reach_private_addresses():
+    respx.get("https://specs.example.com/api.yaml").respond(302, headers={"Location": "http://169.254.169.254/latest"})
+    metadata = respx.get(url__startswith="http://169.254.169.254").respond(200, text="openapi: 3.0.0")
+    with pytest.raises(UnsupportedSpecError, match="https to http|private"):
+        fetch_spec_text("https://specs.example.com/api.yaml")
+    respx.get("https://specs.example.com/b.yaml").respond(302, headers={"Location": "https://10.0.0.5/spec"})
+    with pytest.raises(UnsupportedSpecError, match="private"):
+        fetch_spec_text("https://specs.example.com/b.yaml")
+    assert not metadata.called
+
+
+@respx.mock
+def test_h4_public_redirects_and_local_specs_still_work():
+    respx.get("https://github.example.com/raw/spec.yaml").respond(
+        302, headers={"Location": "https://93.184.216.34/spec.yaml"})   # another public host
+    respx.get("https://93.184.216.34/spec.yaml").respond(200, text="openapi: 3.0.0")
+    assert "openapi" in fetch_spec_text("https://github.example.com/raw/spec.yaml")
+    respx.get("http://127.0.0.1:8000/openapi.json").respond(200, text="{}")
+    assert fetch_spec_text("http://127.0.0.1:8000/openapi.json") == "{}"   # you asked for it
+    with pytest.raises(UnsupportedSpecError, match="private"):
+        fetch_spec_text("http://127.0.0.1:8000/openapi.json", allow_private=False)
+
+
+@pytest.mark.parametrize("schema", [
+    {"type": "string", "pattern": "((a{1000}){1000}){1000}"},
+    {"type": "string", "minLength": 500_000_000},
+    {"type": "array", "minItems": 100_000_000, "items": {"type": "string"}},
+], ids=["nested-repeats", "huge-minLength", "huge-minItems"])
+def test_h11_m21_examples_stay_small_and_fast(schema):
+    import time as _time
+    started = _time.monotonic()
+    with pytest.raises(SchemaTooLarge):
+        Synthesizer().example(schema)
+    assert _time.monotonic() - started < 5
+
+
+def test_h11_catastrophic_pattern_cannot_hang_example_generation():
+    import time as _time
+    started = _time.monotonic()
+    try:
+        Synthesizer().example({"type": "string", "pattern": "(x+x+)+y", "minLength": 40})
+    except SchemaTooLarge:
+        pass
+    assert _time.monotonic() - started < 5
+
+
+def test_regex_examples_respect_min_length():
+    value = regex_example("^ab[0-9]{2,8}$", min_length=7)
+    assert value is not None and len(value) >= 7
+    assert len(Synthesizer().example({"type": "string", "pattern": "^[a-z]+$", "minLength": 12})) >= 12
+
+
+def test_m8_regex_time_is_capped_per_validation():
+    import time as _time
+    started = _time.monotonic()
+    with pytest.raises(SchemaTooLarge):
+        BoundedValidator({"type": "array", "items": {"type": "string", "pattern": "^(a|aa)+$"}}).best_error(
+            ["a" * 28 + "b"] * 200)
+    assert _time.monotonic() - started < 5
+
+
+def test_huge_compiled_regex_is_refused_not_built():
+    with pytest.raises(SchemaTooLarge, match="too large to compile"):
+        BoundedValidator({"type": "string", "pattern": "((a{1000}){1000}){1000}"}).best_error("a")

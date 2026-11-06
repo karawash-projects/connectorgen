@@ -101,6 +101,42 @@ def install_log_redaction() -> None:
     _installed = True
 
 
+def private_address(url: str) -> bool:
+    """True if the URL's host is, or resolves to, a private, loopback, link-local or other
+    non-public address (internal services, cloud metadata endpoints). Unresolvable: False
+    (the request will fail anyway). Note: DNS can change between this check and the request."""
+    import ipaddress
+    import socket
+
+    try:
+        host = (httpx.URL(url).host or "").strip("[]")
+    except Exception:  # noqa: BLE001
+        return False
+    if not host:
+        return False
+    if host.lower() in ("localhost", "localhost.localdomain") or host.lower().endswith(".localhost"):
+        return True
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except OSError:
+            return False
+        addresses = []
+        for info in infos:
+            try:
+                addresses.append(ipaddress.ip_address(info[4][0].split("%")[0]))
+            except ValueError:
+                continue
+    for ip in addresses:
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast:
+            return True
+    return False
+
+
 def check_public_http_url(url: str) -> Any:
     """Raise ValueError unless url is http(s) with a host; returns the parsed URL."""
     u = httpx.URL(url)
