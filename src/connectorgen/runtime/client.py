@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import time
 import warnings
 from collections.abc import Iterator
 from typing import Any, Literal
@@ -75,6 +77,8 @@ class ConnectorClient:
         retry: RetryPolicy | None = None,
         validate_responses: Literal["off", "warn", "raise"] = "off",
         allow_insecure: bool = False,
+        max_response_bytes: int = 50_000_000,
+        max_request_seconds: float = 300.0,
     ):
         """
         retry: defaults to RetryPolicy(); pass RetryPolicy.disabled() to turn retries off.
@@ -84,8 +88,13 @@ class ConnectorClient:
             are often looser than the APIs they describe.
         allow_insecure: send credentials over plain http to hosts other than this
             machine (refused by default: anyone on the network could read them).
+        max_response_bytes, max_request_seconds: limits on one response's (decoded) size
+            and on one request's total time, redirects included. `timeout` alone applies
+            to each network read, so a server sending a byte at a time never trips it.
         """
         self.allow_insecure = allow_insecure
+        self.max_response_bytes = max_response_bytes
+        self.max_request_seconds = max_request_seconds
         self.connector = connector
         self.retry = retry if retry is not None else RetryPolicy()
         self.validate_responses = validate_responses
@@ -166,6 +175,7 @@ class ConnectorClient:
         stats["params"] = dict(params)
         pages = 0
         seen_cursors: set[str] = set()
+        seen_pages: set[str] = set()
         using_links = False
         if start_url:
             request = self._follow_url(request, start_url, self.schemes_for(act))
@@ -184,6 +194,13 @@ class ConnectorClient:
                     f"got {type(items).__name__}."
                 )
             stats["page_items"] = len(items)
+            digest = _page_digest(items)
+            if items and digest in seen_pages:
+                # An API that ignores the page/offset param returns the same page forever.
+                log.warning("%s: page %d repeats an earlier page; stopping", act.name, pages + 1)
+                stats["exhausted"] = True
+                return
+            seen_pages.add(digest)
             yield from items
             pages += 1
 
@@ -459,13 +476,15 @@ class ConnectorClient:
         another origin keeps only harmless headers and must be a GET/HEAD; a downgrade from
         https to http is refused outright."""
         origin_url = request.url
+        deadline = time.monotonic() + self.max_request_seconds
         for _ in range(MAX_REDIRECTS + 1):
             try:
-                response = self.http.send(request, follow_redirects=False)
+                response = self.http.send(request, follow_redirects=False, stream=True)
             except (httpx.InvalidURL, UnicodeError) as e:  # e.g. an invalid IDN host to connect to
                 raise ConnectorError(f"Refusing a malformed URL ({type(e).__name__}).") from None
             location = response.headers.get("location")
             if response.status_code not in (301, 302, 303, 307, 308) or not location:
+                self._read_capped(response, deadline)
                 return response
             try:
                 target = request.url.join(location)
@@ -496,6 +515,27 @@ class ConnectorClient:
             response.close()
             request = httpx.Request(method, target, headers=headers, content=content or None)
         raise ConnectorError(f"Too many redirects (more than {MAX_REDIRECTS}).")
+
+    def _read_capped(self, response: httpx.Response, deadline: float) -> None:
+        """Read a streamed response's body within the size and time limits."""
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            for chunk in response.iter_bytes():
+                size += len(chunk)
+                if size > self.max_response_bytes:
+                    raise ConnectorError(
+                        f"Response from {redact_url(response.request.url)} is larger than "
+                        f"{self.max_response_bytes:,} bytes; refusing to read it all "
+                        "(raise max_response_bytes if it's expected).")
+                if time.monotonic() > deadline:
+                    raise httpx.ReadTimeout(
+                        f"response took longer than {self.max_request_seconds:g}s in total",
+                        request=response.request)
+                chunks.append(chunk)
+        finally:
+            response.close()
+        response._content = b"".join(chunks)  # what response.read() would have stored
 
     def _check_response(self, action: Action, body: Any) -> None:
         if self.validate_responses == "off" or action.output_schema is None or body is None:
@@ -538,6 +578,14 @@ def _unsupported_style(action: Action, p: Any, value: Any) -> ConnectorError:
     kind = "an object" if isinstance(value, dict) else "a list" if isinstance(value, (list, tuple)) else "a value"
     return ConnectorError(f"'{action.name}': can't send {kind} for {p.location} param '{p.name}' "
                           f"with style '{p.style}'.")
+
+
+def _page_digest(items: list[Any]) -> str:
+    try:
+        raw = json.dumps(items, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        raw = repr(items)
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
 def _query_pairs(action: Action, p: Any, value: Any) -> dict[str, Any]:

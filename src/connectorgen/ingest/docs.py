@@ -19,6 +19,7 @@ import ipaddress
 import json
 import logging
 import re
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -48,6 +49,8 @@ from .openapi import _action_name, normalize_schema, snake_case
 HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 log = logging.getLogger("connectorgen")
 MAX_PAGE_BYTES = 5_000_000
+PAGE_SECONDS = 60.0     # one page, however slowly it arrives
+TOTAL_SECONDS = 600.0   # the whole fetch
 MAX_REDIRECTS = 5
 
 # ------------------------------------------------------------------ fetching
@@ -122,13 +125,18 @@ def _looks_like_openapi(body: str) -> bool:
 
 
 def fetch_docs(sources: list[str], *, crawl: bool = False, max_pages: int = 15,
-               http: httpx.Client | None = None, max_bytes: int = MAX_PAGE_BYTES) -> list[DocPage]:
+               http: httpx.Client | None = None, max_bytes: int = MAX_PAGE_BYTES,
+               page_seconds: float = PAGE_SECONDS,
+               total_seconds: float = TOTAL_SECONDS) -> list[DocPage]:
     """Fetch URLs or read local files. With crawl=True, follow links that stay under
     each start URL's directory (same host), breadth-first.
 
     At most max_pages documents are fetched in total (empty pages count), each body is
     capped at max_bytes, and only the origins of the URLs you passed are ever contacted:
-    a redirect or link to another origin (an internal address, say) is skipped."""
+    a redirect or link to another origin (an internal address, say) is skipped. A page that
+    takes longer than page_seconds is skipped, and fetching stops after total_seconds.
+    An OpenAPI spec among the URLs you passed is refused (use `generate`); one reached by
+    crawling is skipped."""
     client = http or httpx.Client(timeout=30, headers={"User-Agent": "connectorgen-docs/0.9"})
     pages: list[DocPage] = []
     allowed = {origin(s) for s in sources if s.startswith(("http://", "https://"))}
@@ -137,14 +145,21 @@ def fetch_docs(sources: list[str], *, crawl: bool = False, max_pages: int = 15,
         seen: set[str] = set()
         roots = [_root(s) for s in sources if s.startswith("http")]
         fetched = 0
+        given = {urldefrag(s)[0] for s in sources}
+        run_deadline = time.monotonic() + total_seconds
         while queue and fetched < max_pages:
+            if time.monotonic() > run_deadline:
+                log.warning("docs: stopped after %gs; %d page(s) read", total_seconds, len(pages))
+                break
             src = urldefrag(queue.popleft())[0]
             if src in seen:
                 continue
             seen.add(src)
             fetched += 1
+            requested = src
             if src.startswith(("http://", "https://")):
-                got = _get_capped(client, src, allowed, max_bytes)
+                got = _get_capped(client, src, allowed, max_bytes,
+                                  min(time.monotonic() + page_seconds, run_deadline))
                 if got is None:
                     continue
                 body, ctype, src = got
@@ -153,8 +168,12 @@ def fetch_docs(sources: list[str], *, crawl: bool = False, max_pages: int = 15,
                 body = Path(src).read_text()
                 ctype = "text/html" if src.endswith((".html", ".htm")) else "text/plain"
             if _looks_like_openapi(body):
-                raise UnsupportedSpecError(
-                    f"{src} is an OpenAPI/Swagger spec; use `connectorgen generate` instead.")
+                if requested in given:
+                    raise UnsupportedSpecError(
+                        f"{src} is an OpenAPI/Swagger spec; use `connectorgen generate` instead.")
+                log.warning("docs: skipped %s (an OpenAPI/Swagger spec; `connectorgen "
+                            "generate` reads it directly)", redact_url(src))
+                continue
             if "html" in ctype or body.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
                 page_text, links = html_to_text(body)
             else:
@@ -183,14 +202,14 @@ def _fetch_allowed(url: str, allowed: set[Any]) -> bool:
 
 
 def _get_capped(client: httpx.Client, url: str, allowed: set[Any],
-                max_bytes: int) -> tuple[str, str, str] | None:
+                max_bytes: int, deadline: float | None = None) -> tuple[str, str, str] | None:
     """(text, content type, final URL), following redirects only within `allowed` origins."""
     for _ in range(MAX_REDIRECTS + 1):
         if not _fetch_allowed(url, allowed):
             log.warning("docs: skipped %s (outside the docs origins you supplied)", redact_url(url))
             return None
         try:
-            got = _stream_once(client, url, max_bytes)
+            got = _stream_once(client, url, max_bytes, deadline)
         except (httpx.InvalidURL, UnicodeError, ValueError) as e:
             log.warning("docs: skipped a malformed URL (%s)", type(e).__name__)
             return None
@@ -202,7 +221,8 @@ def _get_capped(client: httpx.Client, url: str, allowed: set[Any],
     return None
 
 
-def _stream_once(client: httpx.Client, url: str, max_bytes: int) -> tuple[str, str, str] | str | None:
+def _stream_once(client: httpx.Client, url: str, max_bytes: int,
+                 deadline: float | None = None) -> tuple[str, str, str] | str | None:
     """One GET: (text, content type, url), the next URL for a redirect, or None to skip."""
     with client.stream("GET", url, follow_redirects=False) as resp:
         location = resp.headers.get("location")
@@ -215,6 +235,9 @@ def _stream_once(client: httpx.Client, url: str, max_bytes: int) -> tuple[str, s
             size += len(chunk)
             if size > max_bytes:
                 log.warning("docs: skipped %s (larger than %d bytes)", redact_url(url), max_bytes)
+                return None
+            if deadline is not None and time.monotonic() > deadline:
+                log.warning("docs: skipped %s (too slow)", redact_url(url))
                 return None
             chunks.append(chunk)
         raw = b"".join(chunks)

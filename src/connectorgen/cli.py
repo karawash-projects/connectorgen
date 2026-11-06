@@ -613,7 +613,7 @@ def call(
                                      help="key=value (value parsed as JSON when possible)"),
     body: Optional[Path] = typer.Option(None, help="JSON file to send as the request body."),
     paginate: bool = typer.Option(False, help="Follow pagination and print all items."),
-    max_pages: Optional[int] = typer.Option(None),
+    max_pages: int = typer.Option(100, help="With --paginate: stop after this many pages."),
     base_url: Optional[str] = typer.Option(None),
     allow_destructive: bool = typer.Option(False, help="Required for destructive actions."),
     token_file: Optional[Path] = typer.Option(None, help="Saved OAuth token (from `auth`)."),

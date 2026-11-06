@@ -790,3 +790,179 @@ def test_observations_keep_data_out():  # M23
     assert all(data_like_key(k) for k in ("bob@corp.com", "12345", "two words",
                                           "550e8400-e29b-41d4-a716-446655440000"))
     assert not any(data_like_key(k) for k in ("id", "created_at", "user.name", "$type"))
+
+
+# -- step 5: bounded resources -------------------------------------------------------------------
+def _mock_client(actions, handler, **kw):
+    return _client(actions, http=httpx.Client(transport=httpx.MockTransport(handler)), **kw)
+
+
+@pytest.mark.parametrize("style,param", [("page", "page"), ("offset", "offset")])
+def test_api_ignoring_the_page_param_stops(style, param):  # M1
+    act = Action(name="ls", method="GET", path="/ls", params=[Param(name=param, location="query")],
+                 pagination=Pagination(style=style, request_param=param))
+    calls = []
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(200, json=[{"id": 1}, {"id": 2}])
+
+    with _mock_client([act], handler) as cl:
+        assert len(list(cl.paginate("ls"))) == 2
+    assert len(calls) == 2
+
+
+def test_responses_are_capped_in_size():  # M7
+    act = Action(name="get", method="GET", path="/x")
+    with _mock_client([act], lambda r: httpx.Response(200, content=b"x" * 5000),
+                      max_response_bytes=1000) as cl, \
+            pytest.raises(ConnectorError, match="larger than 1,000 bytes"):
+        cl.execute("get")
+
+
+def test_slow_responses_hit_the_total_deadline():  # M7
+    from connectorgen import ConnectionFailedError
+
+    class Drip(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(5):
+                time.sleep(0.05)
+                yield b"x"
+
+    act = Action(name="get", method="GET", path="/x")
+    with _mock_client([act], lambda r: httpx.Response(200, stream=Drip()),
+                      max_request_seconds=0.1, retry=None) as cl:
+        cl.retry = cl.retry.disabled()
+        with pytest.raises(ConnectionFailedError):
+            cl.execute("get")
+
+
+def test_unchanged_unordered_list_emits_nothing_new():  # M9
+    from connectorgen.triggers import Poller
+
+    act = Action(name="list_x", method="GET", path="/x", output_schema={"type": "array"})
+    trig = Trigger(name="new_x", kind="polling", source_action="list_x", dedup_key="id",
+                   order="unknown")
+    c = Connector(name="t", base_url=BASE, actions=[act], triggers=[trig])
+    items = [{"id": i} for i in range(300)]
+    with ConnectorClient(c, http=httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=items)))) as cl:
+        poller = Poller(cl, "new_x", seen_limit=100, max_items=1000)
+        assert [len(poller.poll().items) for _ in range(3)] == [0, 0, 0]
+
+
+def test_docs_crawl_skips_specs_but_refuses_a_given_one():  # M11
+    from connectorgen.ingest.docs import fetch_docs
+
+    def handler(req):
+        if req.url.path.endswith("openapi.yaml"):
+            return httpx.Response(200, text="openapi: 3.0.0\ninfo: {}\n")
+        return httpx.Response(200, text='<html><a href="openapi.yaml">spec</a> API docs</html>',
+                              headers={"content-type": "text/html"})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    pages = fetch_docs(["https://docs.acme.test/api/"], crawl=True, http=http)
+    assert [p.source for p in pages] == ["https://docs.acme.test/api/"]
+    with pytest.raises(UnsupportedSpecError, match="generate"):
+        fetch_docs(["https://docs.acme.test/api/openapi.yaml"], http=http)
+
+
+def test_docs_fetch_deadlines():  # M12
+    from connectorgen.ingest.docs import fetch_docs
+
+    class Drip(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(5):
+                time.sleep(0.05)
+                yield b"x"
+
+    http = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, stream=Drip(), headers={"content-type": "text/plain"})))
+    assert fetch_docs(["https://docs.acme.test/a"], http=http, page_seconds=0.1) == []
+
+
+def test_anthropic_replies_are_validated():  # M20
+    pytest.importorskip("anthropic")
+    from types import SimpleNamespace
+
+    from connectorgen.llm.anthropic import AnthropicLLM
+    from connectorgen.llm.base import LLMError
+
+    replies = iter(['{"unexpected": 1}', '{"still": "wrong"}'])
+
+    class Messages:
+        def create(self, **kw):
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text=next(replies))],
+                                   stop_reason="end_turn", usage=None)
+
+    llm = AnthropicLLM("claude-x", client=SimpleNamespace(messages=Messages()))
+    schema = {"type": "object", "required": ["schemes"], "properties": {"schemes": {"type": "array"}}}
+    with pytest.raises(LLMError, match="schemes"):
+        llm.complete_json(system="s", prompt="p", schema=schema)
+
+
+def test_openai_compatible_bad_replies_are_llm_errors():  # L16
+    from connectorgen.llm.base import LLMError
+    from connectorgen.llm.openai_compat import OpenAICompatibleLLM
+
+    for response in (httpx.Response(200, text="<html>login</html>"), httpx.Response(200, json=[1])):
+        llm = OpenAICompatibleLLM("m", provider=None, base_url="http://127.0.0.1:9/v1",
+                                  http=httpx.Client(transport=httpx.MockTransport(
+                                      lambda r, resp=response: resp)))
+        with pytest.raises(LLMError):
+            llm.complete_json(system="s", prompt="p", schema={"type": "object"})
+
+
+def test_smoke_param_with_only_null_in_enum():  # L12
+    from connectorgen.validate.smoke import run_smoke_tests
+
+    act = Action(name="ls", method="GET", path="/ls", params=[
+        Param(name="kind", location="query", required=True, json_schema={"enum": [None]})])
+    report = run_smoke_tests(Connector(name="t", base_url=BASE, actions=[act]), None)
+    assert report.results[0].status == "skipped"
+
+
+def test_multiple_of_respects_maximum():  # L13
+    assert Synthesizer().example({"type": "integer", "maximum": 0, "multipleOf": 5}) == 0
+    assert Synthesizer().example({"type": "integer", "minimum": 3, "multipleOf": 5}) == 5
+
+
+def test_mcp_tool_list_with_a_repeating_cursor():  # L18
+    import asyncio
+    from types import SimpleNamespace
+
+    from connectorgen.mcp.client import AsyncMcpClient
+
+    class Raw:
+        async def list_tools(self, cursor=None):
+            return SimpleNamespace(tools=[object()], next_cursor="same")
+
+    client = AsyncMcpClient(Connector(name="t", mcp=MCP))
+    client._client = Raw()
+    with pytest.raises(ConnectorError, match="cursor"):
+        asyncio.run(client.list_tools())
+
+
+def test_cache_warns_without_an_identity(tmp_path):  # L19
+    from connectorgen.llm.cache import CachedLLM
+
+    class Bare:
+        model = "m"
+
+    with pytest.warns(UserWarning, match="cache_identity"):
+        CachedLLM(Bare(), tmp_path)
+
+
+def test_regex_bound_is_active():  # L20
+    from connectorgen import limits
+
+    assert limits.RE_SHIM_INSTALLED
+
+
+def test_deep_ref_chains_are_refused_not_crashed():  # L4
+    from connectorgen.limits import inplace_work
+
+    defs = {f"D{i}": {"$ref": f"#/$defs/D{i + 1}"} for i in range(5000)}
+    defs["D5000"] = {"type": "string"}
+    with pytest.raises(SchemaTooLarge):
+        inplace_work({"$ref": "#/$defs/D0"}, defs)

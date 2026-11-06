@@ -131,7 +131,7 @@ def test_max_pages(client):
 @respx.mock
 def test_repeated_cursor_stops(client):
     respx.get(f"{BASE}/pets").respond(json={"data": [{"id": 1}], "meta": {"next_cursor": "same"}})
-    assert len(list(client.paginate("list_pets"))) == 2  # second page repeats cursor -> stop
+    assert len(list(client.paginate("list_pets"))) == 1  # the same page again -> stop, no duplicates
 
 
 def test_unknown_action(client):

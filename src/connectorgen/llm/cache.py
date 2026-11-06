@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -56,8 +57,20 @@ class CachedLLM:
         self.directory.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self.directory, 0o700)
-        except OSError:  # pragma: no cover - e.g. not the owner
+        except OSError:  # e.g. not the owner
             pass
+        try:
+            loose = os.name != "nt" and bool(self.directory.stat().st_mode & 0o022)
+        except OSError:
+            loose = False
+        if loose:  # others could plant answers that later runs would trust
+            warnings.warn(f"LLM cache directory {self.directory} is writable by other users; "
+                          "use a private directory (CONNECTORGEN_CACHE_DIR).", stacklevel=2)
+        if not getattr(inner, "cache_identity", None):
+            warnings.warn(f"{type(inner).__name__} has no cache_identity, so answers are cached "
+                          "per class and model name only: two endpoints serving the same "
+                          "model name would share answers. Set cache_identity to include "
+                          "the endpoint.", stacklevel=2)
 
     @property
     def usage(self) -> Usage:

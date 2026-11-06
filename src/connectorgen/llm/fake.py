@@ -24,6 +24,7 @@ class FakeLLM:
     def __init__(self, responder: Callable[[FakeCall], dict[str, Any]] | list[dict[str, Any]],
                  model: str = "fake-model"):
         self.model = model
+        self.cache_identity = f"fake:{model}"
         self.usage = Usage()
         self.calls: list[FakeCall] = []
         self._queue = list(responder) if isinstance(responder, list) else None

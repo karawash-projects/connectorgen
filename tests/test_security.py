@@ -554,6 +554,7 @@ def test_cache_key_includes_provider_and_endpoint(tmp_path):
 
 def test_planted_or_invalid_cache_entries_are_ignored(tmp_path):
     inner = _Echo("m", {"x": 5})
+    inner.cache_identity = "echo:m"
     cached = CachedLLM(inner, tmp_path)
     cached.complete_json(system="s", prompt="p", schema=SCHEMA)
     for f in tmp_path.glob("*.json"):

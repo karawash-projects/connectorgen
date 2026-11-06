@@ -44,6 +44,25 @@ class AnthropicLLM:
 
     def complete_json(self, *, system: str, prompt: str, schema: dict[str, Any],
                       max_tokens: int = 8000) -> dict[str, Any]:
+        """The reply, checked against `schema` (one repair round if it doesn't match)."""
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import best_match
+
+        validator = Draft202012Validator(schema)
+        user, problem = prompt, ""
+        for _ in range(2):
+            data = self._complete(system, user, schema, max_tokens)
+            error = best_match(validator.iter_errors(data))
+            if error is None:
+                return data
+            where = ".".join(map(str, error.path)) or "(root)"
+            problem = f"at {where}: {error.message[:300]}"
+            user = (f"{prompt}\n\nYour previous reply didn't match the required JSON Schema "
+                    f"({problem}). Reply again with only a JSON object that matches it.")
+        raise LLMError(f"{self.model} didn't return JSON matching the schema: {problem}")
+
+    def _complete(self, system: str, prompt: str, schema: dict[str, Any],
+                  max_tokens: int) -> Any:
         try:
             response = self.client.messages.create(
                 model=self.model,

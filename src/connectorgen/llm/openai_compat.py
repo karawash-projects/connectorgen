@@ -172,9 +172,21 @@ class OpenAICompatibleLLM:
                 continue
             if resp.is_error:
                 raise LLMError(f"{self.provider} {self.model}: HTTP {resp.status_code}: {resp.text[:400]}")
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                raise LLMError(f"{self.provider} {self.model}: the reply wasn't JSON "
+                               f"(HTTP {resp.status_code}: {resp.text[:200]!r})") from None
+            if not isinstance(data, dict):
+                raise LLMError(f"{self.provider} {self.model}: unexpected reply "
+                               f"({type(data).__name__}, not an object)")
             self.usage.calls += 1
-            return self._read_responses(data) if self.api == "responses" else self._read_chat(data)
+            try:
+                return self._read_responses(data) if self.api == "responses" \
+                    else self._read_chat(data)
+            except (AttributeError, TypeError, KeyError) as e:  # a reply in the wrong shape
+                raise LLMError(f"{self.provider} {self.model}: unexpected reply shape "
+                               f"({type(e).__name__})") from None
 
     def _post(self, path: str, body: dict[str, Any]) -> httpx.Response:
         for attempt in range(self.max_retries + 1):
@@ -190,6 +202,8 @@ class OpenAICompatibleLLM:
                 try:
                     delay = min(30.0, float(wait)) if wait else min(8.0, 0.5 * 2 ** attempt)
                 except ValueError:
+                    delay = min(8.0, 0.5 * 2 ** attempt)
+                if not delay >= 0:  # negative or NaN Retry-After
                     delay = min(8.0, 0.5 * 2 ** attempt)
                 time.sleep(delay)
                 continue

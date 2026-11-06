@@ -18,6 +18,7 @@ from typing import Any
 
 from ..errors import ConnectorError
 from ..ir import Action, Connector, referenced_defs
+from ..limits import BoundedValidator, SchemaTooLarge
 from ..runtime.auth import Credentials
 
 log = logging.getLogger("connectorgen")
@@ -107,6 +108,8 @@ def build_mcp_server(
     by_name = {a.name: a for a in exposed}
     tools = [tool_for_action(connector, a) for a in exposed]
     structured = {tool.name: tool.output_schema is not None for tool in tools}
+    output_checks = {tool.name: BoundedValidator(tool.output_schema)
+                     for tool in tools if tool.output_schema is not None}
     if client is None:
         extra: dict[str, Any] = {"allow_insecure": allow_insecure}
         if base_url and connector.mcp is None:
@@ -126,10 +129,16 @@ def build_mcp_server(
         except ConnectorError as e:
             return _error(str(e))
         text = result if isinstance(result, str) else json.dumps(result, default=str)
-        return t.CallToolResult(
-            content=[t.TextContent(type="text", text=text)],
-            structured_content=result if structured[action.name] and isinstance(result, dict) else None,
-        )
+        if not structured[action.name]:
+            return t.CallToolResult(content=[t.TextContent(type="text", text=text)])
+        # A tool with an output schema must return structured content that matches it, or
+        # MCP clients reject the whole result; say so instead, with the response attached.
+        problem = _output_problem(output_checks[action.name], result)
+        if problem:
+            return _error(f"The API's response doesn't match this tool's output schema "
+                          f"({problem}). Response: {text[:20000]}")
+        return t.CallToolResult(content=[t.TextContent(type="text", text=text)],
+                                structured_content=result)
 
     def _error(message: str) -> Any:
         return t.CallToolResult(content=[t.TextContent(type="text", text=message)], is_error=True)
@@ -144,6 +153,19 @@ def build_mcp_server(
     )
     server.connectorgen_client = client  # type: ignore[attr-defined]  # caller may close it
     return server
+
+
+def _output_problem(check: BoundedValidator, result: Any) -> str:
+    if not isinstance(result, dict):
+        return f"got {'nothing' if result is None else type(result).__name__}, not an object"
+    try:
+        error = check.best_error(result)
+    except SchemaTooLarge:
+        return ""  # can't tell; let the client decide
+    if error is None:
+        return ""
+    where = ".".join(map(str, error.path)) or "(root)"
+    return f"at {where}: {error.message[:200]}"
 
 
 async def serve_stdio(server: Any) -> None:

@@ -132,7 +132,7 @@ def _fill_mcp(action: Action, inputs: dict[str, Any], global_params: dict[str, A
         prop = props.get(name) or {}
         if "default" in prop:
             values[name] = prop["default"]
-        elif prop.get("enum"):
+        elif isinstance(prop.get("enum"), list) and any(v is not None for v in prop["enum"]):
             values[name] = next(v for v in prop["enum"] if v is not None)
         elif pool.by_field.get(name) is not None:
             values[name] = pool.by_field[name]
@@ -157,7 +157,7 @@ def _fill(action: Action, inputs: dict[str, Any], global_params: dict[str, Any],
         schema = p.json_schema
         if "default" in schema:
             values[p.name] = schema["default"]
-        elif schema.get("enum"):
+        elif isinstance(schema.get("enum"), list) and any(v is not None for v in schema["enum"]):
             values[p.name] = next(v for v in schema["enum"] if v is not None)
         else:
             found = pool.lookup(action, p.name)
@@ -166,9 +166,9 @@ def _fill(action: Action, inputs: dict[str, Any], global_params: dict[str, Any],
             values[p.name] = found
     if action.body_required:
         return None, "needs a request body"
-    p = action.pagination
-    if p.limit_param and p.limit_param not in values:
-        values[p.limit_param] = 2
+    pagination = action.pagination
+    if pagination.limit_param and pagination.limit_param not in values:
+        values[pagination.limit_param] = 2
     return values, ""
 
 

@@ -45,6 +45,20 @@ def _require_sdk() -> Any:
     return mcp
 
 
+def _mcp_http_client(headers: dict[str, str]) -> Any:
+    """The async HTTP client the SDK's transport takes (httpx2 in newer SDKs, httpx in
+    older ones), with the SDK's usual timeouts: 30s, and 300s reads for open streams."""
+    try:
+        import httpx2 as hx  # type: ignore[import-not-found]
+    except ImportError:
+        import httpx as hx
+    return hx.AsyncClient(headers=headers, timeout=hx.Timeout(30.0, read=300.0))
+
+
+MAX_TOOL_PAGES = 1_000
+MAX_TOOLS = 10_000
+
+
 def _target(connector: Connector, credentials: Credentials | None,
             env: dict[str, str] | None, *, allow_insecure: bool = False) -> tuple[Any, Any]:
     """(what to pass to mcp.Client, an http client to close afterwards or None)."""
@@ -72,7 +86,6 @@ def _target(connector: Connector, credentials: Credentials | None,
                                      cwd=cfg.cwd), None
 
     from mcp.client.streamable_http import streamable_http_client
-    from mcp.shared._httpx_utils import create_mcp_http_client
 
     if not cfg.url:
         raise ConnectorError("MCP http config has no url.")
@@ -95,7 +108,7 @@ def _target(connector: Connector, credentials: Credentials | None,
         from urllib.parse import urlencode
 
         url += ("&" if "?" in url else "?") + urlencode(query)
-    http = create_mcp_http_client(headers=headers)
+    http = _mcp_http_client(headers)
     return streamable_http_client(url, http_client=http), http
 
 
@@ -198,13 +211,21 @@ class AsyncMcpClient:
         return self._client
 
     async def list_tools(self) -> list[Any]:
-        tools, cursor = [], None
-        while True:
+        tools: list[Any] = []
+        cursor, seen = None, set()
+        for _ in range(MAX_TOOL_PAGES):
             page = await self.raw.list_tools(cursor=cursor)
             tools += page.tools
             cursor = page.next_cursor
             if not cursor:
                 return tools
+            if cursor in seen:
+                raise ConnectorError("MCP server repeated a tools/list cursor; its tool list "
+                                     "never ends.")
+            seen.add(cursor)
+            if len(tools) > MAX_TOOLS:
+                raise ConnectorError(f"MCP server lists more than {MAX_TOOLS:,} tools.")
+        raise ConnectorError(f"MCP server's tool list is longer than {MAX_TOOL_PAGES} pages.")
 
     async def execute(self, action: str | Action, inputs: dict[str, Any] | None = None,
                       **kwargs: Any) -> Any:

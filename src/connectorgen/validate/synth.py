@@ -227,10 +227,14 @@ class Synthesizer:
         if hi is not None and value > hi:
             value = hi
         multiple = schema.get("multipleOf")
-        if multiple:
-            value = (int(value / multiple) or 1) * multiple
-            if lo is not None and value < lo:
-                value += multiple
+        if isinstance(multiple, (int, float)) and not isinstance(multiple, bool) and multiple > 0:
+            import math
+
+            # The smallest multiple >= lo (or a positive one), stepped down if that passes hi.
+            start = lo if lo is not None else (multiple if hi is None or hi >= multiple else hi)
+            value = math.ceil(start / multiple) * multiple
+            if hi is not None and value > hi:
+                value = math.floor(hi / multiple) * multiple
         if integer:
             import math
             value = math.ceil(value) if lo is not None else int(value)

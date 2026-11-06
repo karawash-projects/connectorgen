@@ -13,6 +13,7 @@ import functools
 import json
 import re
 import time
+import warnings
 from typing import Any
 
 from jsonschema import Draft202012Validator, validators
@@ -22,6 +23,7 @@ DEFS_PREFIX = "#/$defs/"
 
 # Subschemas evaluated in place for one value. Real APIs are in the tens or hundreds.
 MAX_INPLACE_WORK = 50_000
+MAX_INPLACE_DEPTH = 200  # $ref / allOf / ... chains, followed recursively
 _INPLACE_LISTS = ("allOf", "anyOf", "oneOf")
 _INPLACE_ONE = ("not", "if", "then", "else")
 
@@ -176,12 +178,14 @@ class _ReShim:
         return _bounded_search(pattern, string, flags)
 
 
-def _install_re_shim() -> None:
+def _install_re_shim() -> bool:
+    """Swap the shim in; False if jsonschema no longer uses `re` the way it's expected to."""
     from jsonschema import _keywords, _utils
 
     for module in (_keywords, _utils):
         if getattr(module, "re", None) is re:
             module.re = _ReShim()  # type: ignore[attr-defined]
+    return all(isinstance(getattr(m, "re", None), _ReShim) for m in (_keywords, _utils))
 
 
 def _canonical(value: Any) -> str:
@@ -233,7 +237,11 @@ def _enum(validator: Any, enums: Any, instance: Any, schema: Any) -> Any:
         yield ValidationError(f"{instance!r} is not one of {enums!r}")
 
 
-_install_re_shim()
+RE_SHIM_INSTALLED = _install_re_shim()
+if not RE_SHIM_INSTALLED:  # pragma: no cover - a jsonschema release changed its internals
+    warnings.warn("connectorgen couldn't bound regex matching in this jsonschema version; "
+                  "`pattern` in untrusted schemas may be slow to check.", RuntimeWarning,
+                  stacklevel=2)
 # Built once: creating validator classes is slow and defeats jsonschema's caches.
 _CountingValidator = validators.extend(
     Draft202012Validator,
@@ -270,20 +278,24 @@ class BoundedValidator:
         return self.best_error(instance) is None
 
 
-_defs_checked: list[Any] = [None, False]  # (the defs dict last checked, all cheap?)
+# (the defs dict last checked, all cheap?), replaced as one tuple so threads never see
+# one connector's dict paired with another's answer.
+_defs_checked: tuple[Any, bool] = (None, False)
 
 
 def check_schema_work(schema: Any, defs: dict[str, Any], limit: int = MAX_INPLACE_WORK) -> None:
     """Raise SchemaTooLarge if checking a value against `schema` could take unreasonable work.
     Shared definitions are walked once per connector (cached), then each schema only needs
     its own subschemas checked."""
-    if _defs_checked[0] is not defs:
+    global _defs_checked
+    checked, ok = _defs_checked
+    if checked is not defs:
         try:
             ok = inplace_work({"$defs-all": list(defs.values())}, defs, limit, follow_refs=False) >= 0
         except SchemaTooLarge:
             ok = False  # some definition is too costly: check each action's reachable ones
-        _defs_checked[0], _defs_checked[1] = defs, ok
-    inplace_work(schema, defs, limit, follow_refs=not _defs_checked[1])
+        _defs_checked = (defs, ok)
+    inplace_work(schema, defs, limit, follow_refs=not ok)
 
 
 def inplace_work(schema: Any, defs: dict[str, Any], limit: int = MAX_INPLACE_WORK, *,
@@ -294,30 +306,32 @@ def inplace_work(schema: Any, defs: dict[str, Any], limit: int = MAX_INPLACE_WOR
     memo: dict[str, int] = {}
     active: set[str] = set()
 
-    def cost(node: Any) -> int:
+    def cost(node: Any, depth: int = 0) -> int:
         if not isinstance(node, dict):
             return 1
+        if depth > MAX_INPLACE_DEPTH:
+            raise SchemaTooLarge(f"subschemas nest more than {MAX_INPLACE_DEPTH} levels deep")
         total = 1
         ref = node.get("$ref")
         if isinstance(ref, str) and ref.startswith(DEFS_PREFIX):
-            total += ref_cost(ref)
+            total += ref_cost(ref, depth + 1)
         for key in _INPLACE_LISTS:
             for sub in node.get(key) or []:
-                total += cost(sub)
+                total += cost(sub, depth + 1)
         for key in _INPLACE_ONE:
             if key in node:
-                total += cost(node[key])
+                total += cost(node[key], depth + 1)
         if total > limit:
             raise SchemaTooLarge(f"validating one value would evaluate more than {limit:,} subschemas")
         return total
 
-    def ref_cost(ref: str) -> int:
+    def ref_cost(ref: str, depth: int) -> int:
         if ref in memo:
             return memo[ref]
         if ref in active:  # recursion through in-place keywords: the validator would loop too
             return limit + 1
         active.add(ref)
-        memo[ref] = cost(resolve(ref))
+        memo[ref] = cost(resolve(ref), depth)
         active.discard(ref)
         return memo[ref]
 

@@ -179,9 +179,17 @@ class Poller:
         baseline = not state["initialized"]
         emitted = [item for _, item in new] if (not baseline or self.emit_on_first_run) else []
 
-        keys = state["seen"] + [k for k, _ in new]
+        if newest_first:  # polls stop at the first known item: the newest keys are enough
+            keys = (state["seen"] + [k for k, _ in new])[-self.seen_limit:]
+        else:
+            # The whole list is read each time, so everything read stays remembered however
+            # many items that is: evicting a key still in the list would make it look new.
+            current = set(fetched)
+            older = [k for k in state["seen"] if k not in current]
+            room = max(self.seen_limit - len(fetched), 0)
+            keys = (older[-room:] if room else []) + list(fetched)
         next_state: dict[str, Any] = {
-            "seen": keys[-self.seen_limit:],
+            "seen": keys,
             # a resumable baseline stays open until it has read to the end of the list
             "initialized": True if not self.resumable else (state["initialized"] or exhausted),
             "last_poll": time.time(),
