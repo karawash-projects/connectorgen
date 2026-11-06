@@ -3,7 +3,8 @@
 Covers what real Swagger specs use:
 - host / basePath / schemes            -> servers
 - definitions, parameters, responses   -> components (with every $ref rewritten)
-- body and formData parameters         -> requestBody (JSON / urlencoded / multipart)
+- body and formData parameters         -> requestBody (JSON / urlencoded; multipart bodies are
+                                          converted but not sent by the runtime yet)
 - consumes / produces                  -> media types on bodies and responses
 - type/format/items/enum/... on params -> parameter schemas; collectionFormat -> style/explode
 - type: file                           -> string/binary; x-nullable -> nullable
@@ -16,6 +17,7 @@ from __future__ import annotations
 import copy
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from ..errors import UnsupportedSpecError
 
@@ -41,12 +43,42 @@ class _Converter:
         self.consumes: list[str] = spec.get("consumes") or ["application/json"]
         self.produces: list[str] = spec.get("produces") or ["application/json"]
         self.global_params: dict[str, Any] = spec.get("parameters") or {}
+        self._inlining: set[str] = set()
 
     def _json_type(self) -> str:
         return next((c for c in self.produces if _is_json(c)), self.produces[0] if self.produces
                     else "application/json")
 
     # ---------------------------------------------------------------- refs and schemas
+
+    def _source(self, ref: str) -> Any:
+        """The Swagger node a local ref points at, or None."""
+        node: Any = self.src
+        for part in ref[2:].split("/"):
+            key = unquote(part).replace("~1", "/").replace("~0", "~")
+            try:
+                node = node[int(key)] if isinstance(node, list) else node[key]
+            except (KeyError, IndexError, ValueError, TypeError):
+                return None
+        return node
+
+    @staticmethod
+    def _inline_target(ref: str) -> bool:
+        """Refs whose place moves in OpenAPI 3 (into paths, which lose body params and gain
+        media types, or into a response's schema): copied in rather than rewritten."""
+        return ref.startswith("#/paths/") or bool(re.match(r"#/responses/[^/]+/schema(/|$)", ref))
+
+    def _inlined(self, ref: str, convert: Any) -> Any:
+        if ref in self._inlining:
+            raise UnsupportedSpecError(f"$ref refers to itself: {ref}")
+        target = self._source(ref)
+        if target is None:
+            raise UnsupportedSpecError(f"Unresolvable $ref: {ref}")
+        self._inlining.add(ref)
+        try:
+            return convert(target)
+        finally:
+            self._inlining.discard(ref)
 
     def ref(self, ref: str) -> str:
         if ref.startswith("#/paths/"):
@@ -71,6 +103,11 @@ class _Converter:
             return [self.schema(x) for x in node]
         if not isinstance(node, dict):
             return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and self._inline_target(ref):
+            inlined = self._inlined(ref, self.schema)
+            rest = self.schema({k: v for k, v in node.items() if k != "$ref"})
+            return {**inlined, **rest} if isinstance(inlined, dict) else inlined
         out: dict[str, Any] = {}
         for k, v in node.items():
             if k == "$ref" and isinstance(v, str):
@@ -94,6 +131,11 @@ class _Converter:
 
     def resolve_param(self, p: dict[str, Any]) -> dict[str, Any]:
         ref = p.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/paths/"):
+            target = self._inlined(ref, lambda t: t)
+            if not isinstance(target, dict):
+                raise UnsupportedSpecError(f"Unresolvable $ref: {ref}")
+            return self.resolve_param(target)
         if isinstance(ref, str) and ref.startswith("#/parameters/"):
             name = ref[len("#/parameters/"):].replace("~1", "/").replace("~0", "~")
             if name not in self.global_params:
@@ -168,6 +210,8 @@ class _Converter:
 
     def response(self, r: dict[str, Any], produces: list[str]) -> dict[str, Any]:
         if "$ref" in r:
+            if str(r["$ref"]).startswith("#/paths/"):
+                return self._inlined(r["$ref"], lambda t: self.response(t, produces))
             return {"$ref": self.ref(r["$ref"])}
         out: dict[str, Any] = {"description": r.get("description") or ""}
         if isinstance(r.get("schema"), dict):
@@ -288,9 +332,9 @@ class _Converter:
         return "$ref" in p and self._resolved_in(p) in ("body", "formData")
 
     def _param_or_ref(self, p: dict[str, Any]) -> dict[str, Any]:
-        if "$ref" in p:
+        if "$ref" in p and not str(p["$ref"]).startswith("#/paths/"):
             return {"$ref": self.ref(p["$ref"])}
-        return self.parameter(p)
+        return self.parameter(self.resolve_param(p))
 
     def operation(self, op: dict[str, Any], inherited_bodies: list[dict[str, Any]]) -> dict[str, Any]:
         out: dict[str, Any] = {k: copy.deepcopy(v) for k, v in op.items()
@@ -300,8 +344,15 @@ class _Converter:
         produces = op.get("produces") or self.produces
         raw = op.get("parameters") or []
         resolved = [self.resolve_param(p) for p in raw]
-        body_params = [p for p in inherited_bodies] + \
-            [r for r, p in zip(resolved, raw) if r.get("in") in ("body", "formData")]
+        own = [r for r in resolved if r.get("in") in ("body", "formData")]
+        if any(r.get("in") == "body" for r in own):
+            inherited_bodies = []  # the operation's own body replaces the path's
+        elif own:  # own form fields: keep the path's other form fields
+            names = {r.get("name") for r in own}
+            inherited_bodies = [p for p in inherited_bodies
+                                if self.resolve_param(p).get("in") == "formData"
+                                and self.resolve_param(p).get("name") not in names]
+        body_params = [*inherited_bodies, *own]
         simple = [p for r, p in zip(resolved, raw) if r.get("in") not in ("body", "formData")]
         if simple:
             out["parameters"] = [self._param_or_ref(p) for p in simple]

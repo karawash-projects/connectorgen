@@ -193,8 +193,14 @@ def _expand(schema: Any, defs: dict[str, Any], depth: int = 32, seen: frozenset[
     return out
 
 
-def _shape(schema: Any, defs: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
+def _shape(schema: Any, defs: dict[str, Any],
+           seen: frozenset[str] = frozenset()) -> tuple[dict[str, Any], set[str]]:
     """Top-level properties (expanded) and required names."""
+    ref = schema.get("$ref") if isinstance(schema, dict) else None
+    if isinstance(ref, str):
+        if ref in seen:  # a schema that includes itself through allOf
+            return {}, set()
+        seen = seen | {ref}
     budget = _budget.get()
     if budget is not None:
         budget[0] -= 1
@@ -206,7 +212,7 @@ def _shape(schema: Any, defs: dict[str, Any]) -> tuple[dict[str, Any], set[str]]
     props = dict(s.get("properties") or {})
     required = set(s.get("required") or [])
     for sub in s.get("allOf") or []:
-        p, r = _shape(sub, defs)
+        p, r = _shape(sub, defs, seen)
         props.update(p)
         required |= r
     return {k: _expand(v, defs) for k, v in props.items()}, required
@@ -335,17 +341,22 @@ def _add_worst(diff: ConnectorDiff, target: str, kind: str, prefix: str,
 _FIELD_KEYS = ("properties", "required", "allOf")
 
 
-def _top_level(schema: Any, defs: dict[str, Any]) -> Any:
+def _top_level(schema: Any, defs: dict[str, Any], seen: frozenset[str] = frozenset()) -> Any:
     """The schema's own constraints (type, additionalProperties, minProperties, oneOf, ...)
     without its fields, which are compared one by one. Constraints inside `allOf` members
     apply to the whole value too, so they're lifted up (or kept as a stripped allOf)."""
+    ref = schema.get("$ref") if isinstance(schema, dict) else None
+    if isinstance(ref, str):
+        if ref in seen:  # a schema that includes itself through allOf
+            return {}
+        seen = seen | {ref}
     s, _, _ = deref(schema, defs)
     if not isinstance(s, dict):
         return s
     top = {k: v for k, v in s.items() if k not in _FIELD_KEYS}
     leftover = []
     for member in s.get("allOf") or []:
-        m = _top_level(member, defs)
+        m = _top_level(member, defs, seen)
         if not isinstance(m, dict):
             continue
         for k, v in m.items():
@@ -583,6 +594,9 @@ def _compare_actions(diff: ConnectorDiff, old: Action, new: Action, old_c: Conne
         diff.add("review", t, "no_longer_read_only", "no longer read-only")
     elif new.safe and not old.safe:
         diff.add("review", t, "now_read_only", "now read-only (smoke tests would start calling it)")
+    if old.security_sets != new.security_sets and old.security == new.security:
+        diff.add("review", t, "security_changed",
+                 f"auth requirement {old.security_sets} -> {new.security_sets}")
     if old.security != new.security:
         diff.add("review", t, "security_changed",
                  f"accepted auth {old.security if old.security is not None else 'any'} -> "

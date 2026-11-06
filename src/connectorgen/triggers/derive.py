@@ -19,13 +19,19 @@ DIRECTION_PARAMS = ("direction", "order", "sort_order", "sortorder", "sort_direc
 _PREFIXES = ("list_", "get_", "search_", "fetch_", "find_")
 
 
-def _object_props(schema: Any, defs: dict[str, Any]) -> dict[str, Any]:
+def _object_props(schema: Any, defs: dict[str, Any],
+                  seen: frozenset[str] = frozenset()) -> dict[str, Any]:
+    ref = schema.get("$ref") if isinstance(schema, dict) else None
+    if isinstance(ref, str):
+        if ref in seen:  # a schema that includes itself through allOf
+            return {}
+        seen = seen | {ref}
     schema, _, _ = deref(schema, defs)
     if not isinstance(schema, dict):
         return {}
-    props = dict(schema.get("properties") or {})
-    for sub in schema.get("allOf") or []:
-        props.update(_object_props(sub, defs))
+    props = dict(schema.get("properties") or {}) if isinstance(schema.get("properties"), dict) else {}
+    for sub in schema.get("allOf") or [] if isinstance(schema.get("allOf"), list) else []:
+        props.update(_object_props(sub, defs, seen))
     return props
 
 

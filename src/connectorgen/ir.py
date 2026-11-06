@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, PrivateAttr, ValidationError
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, model_validator
 
 IR_VERSION = "1"
 
@@ -29,6 +29,13 @@ class Param(BaseModel):
     # key (?id=1&id=2); explode=False joins them (?id=1,2); path/header arrays are joined.
     style: str | None = None
     explode: bool | None = None
+    # The name sent to the API, when it differs from the input name (a param called
+    # "body" next to a request body is input `body_param`, sent as `body`).
+    wire_name: str | None = None
+
+    @property
+    def sent_name(self) -> str:
+        return self.wire_name or self.name
 
 
 class Pagination(BaseModel):
@@ -145,6 +152,9 @@ class Action(BaseModel):
     # Auth schemes (ids in Connector.auth) this action accepts, from the spec's
     # per-operation `security`. None = any of the connector's schemes; [] = no auth.
     security: list[str] | None = None
+    # The full requirement: alternatives, each needing *all* its schemes ([] = anonymous
+    # is allowed). None = use `security` (any one of those schemes).
+    security_sets: list[list[str]] | None = None
     mcp_tool: str | None = None
     arguments_schema: dict[str, Any] | None = None
     mcp_annotations: dict[str, Any] = Field(default_factory=dict)
@@ -160,6 +170,26 @@ class Action(BaseModel):
     def safe(self) -> bool:
         """Read-only: OK to call in live smoke tests."""
         return self.method == "GET" and not self.destructive
+
+    @model_validator(mode="after")
+    def _separate_body_param(self) -> Action:
+        """`body` is the request body's input name, so a param with that name is renamed
+        (and still sent as `body`)."""
+        if self.body_schema is None:
+            return self
+        names = {p.name for p in self.params}
+        for p in self.params:
+            if p.name == "body":
+                new = "body_param"
+                while new in names:
+                    new += "_"
+                if p.location == "path":
+                    self.path = self.path.replace("{body}", "{" + new + "}")
+                else:
+                    p.wire_name = p.wire_name or "body"
+                p.name = new
+                names.add(new)
+        return self
 
     def input_schema(self) -> dict[str, Any]:
         """One JSON Schema covering every input: params by name, plus `body`

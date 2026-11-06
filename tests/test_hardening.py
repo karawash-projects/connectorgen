@@ -426,3 +426,250 @@ def test_m8_regex_time_is_capped_per_validation():
 def test_huge_compiled_regex_is_refused_not_built():
     with pytest.raises(SchemaTooLarge, match="too large to compile"):
         BoundedValidator({"type": "string", "pattern": "((a{1000}){1000}){1000}"}).best_error("a")
+
+
+# -- step 3: requests match the spec ------------------------------------------------------------
+from urllib.parse import parse_qsl, urlsplit  # noqa: E402
+
+from connectorgen import ConnectorClient  # noqa: E402
+from connectorgen.ingest.docs import _build_action, _grounded, _merge  # noqa: E402
+from connectorgen.ir import AuthScheme, Pagination, Param  # noqa: E402
+from connectorgen.runtime.auth import Credentials  # noqa: E402
+
+
+def _query(request):
+    return parse_qsl(urlsplit(str(request.url)).query, keep_blank_values=True)
+
+
+def _client(actions, auth=(), **kw):
+    return ConnectorClient(Connector(name="t", base_url=BASE, auth=list(auth), actions=actions), **kw)
+
+
+def test_object_query_params_follow_their_style():  # H1
+    params = [Param(name="filter", location="query", style="deepObject", explode=True,
+                    json_schema={"type": "object"}),
+              Param(name="point", location="query", json_schema={"type": "object"}),
+              Param(name="pair", location="query", style="form", explode=False,
+                    json_schema={"type": "object"}),
+              Param(name="ids", location="query", style="pipeDelimited", explode=False,
+                    json_schema={"type": "array"})]
+    act = Action(name="find", method="GET", path="/find", params=params)
+    with _client([act]) as cl:
+        r = cl.build_request(act, {"filter": {"status": "open", "owner": {"id": 3}},
+                                   "point": {"x": 1, "y": 2}, "pair": {"a": 1},
+                                   "ids": [1, 2]})
+    assert _query(r) == [("filter[status]", "open"), ("filter[owner][id]", "3"),
+                         ("x", "1"), ("y", "2"), ("pair", "a,1"), ("ids", "1|2")]
+
+
+def test_path_and_header_styles():  # H1
+    act = Action(name="get", method="GET", path="/items/{id}", params=[
+        Param(name="id", location="path", required=True, style="label",
+              json_schema={"type": "array"}),
+        Param(name="X-Tags", location="header", json_schema={"type": "array"})])
+    with _client([act]) as cl:
+        r = cl.build_request(act, {"id": [1, 2], "X-Tags": ["a", "b"]})
+    assert r.url.path.endswith("/items/.1,2") and r.headers["X-Tags"] == "a,b"  # explode=false
+
+
+def test_next_page_url_keeps_post_and_its_body():  # M2
+    act = Action(name="search", method="POST", path="/search", body_schema={"type": "object"},
+                 params=[Param(name="cursor", location="query")],
+                 pagination=Pagination(style="cursor", request_param="cursor", items_path="data",
+                                       response_cursor_path="next"))
+    sent = []
+
+    def handler(req):
+        req.read()
+        sent.append(req)
+        if req.url.params.get("p"):
+            return httpx.Response(200, json={"data": [{"id": 2}], "next": None})
+        return httpx.Response(200, json={"data": [{"id": 1}], "next": f"{BASE}/search?p=2"})
+
+    with _client([act], http=httpx.Client(transport=httpx.MockTransport(handler))) as cl:
+        assert [x["id"] for x in cl.paginate("search", body={"q": "red"})] == [1, 2]
+    assert [(r.method, json.loads(r.content)) for r in sent] == [("POST", {"q": "red"})] * 2
+
+
+def test_schemes_that_must_be_combined_are_all_sent():  # M3
+    auth = [AuthScheme(id="key", type="api_key", param_name="X-Key", location="header"),
+            AuthScheme(id="app", type="api_key", param_name="app_id", location="query")]
+    act = Action(name="get", method="GET", path="/x", security=["key", "app"],
+                 security_sets=[["key", "app"]])
+    creds = Credentials(api_keys={"key": "K", "app": "A"})
+    with _client([act], auth, credentials=creds) as cl:
+        r = cl.build_request(act, {})
+    assert r.headers["X-Key"] == "K" and ("app_id", "A") in _query(r)
+    with _client([act], auth, credentials=Credentials(api_keys={"key": "K"})) as cl, \
+            pytest.raises(ConnectorError, match="key \\+ app"):
+        cl.build_request(act, {})
+
+
+def test_combined_security_is_read_from_the_spec():  # M3, L8
+    schemes = {"key": {"type": "apiKey", "in": "header", "name": "X-Key"},
+               "app": {"type": "apiKey", "in": "query", "name": "app_id"}}
+    paths = {"/a": {"get": {"operationId": "a", "security": [{"key": [], "app": []}, {}],
+                            "responses": {"200": {"description": "ok"}}}},
+             "/b": {"get": {"operationId": "b", "security": [{"typo": []}],
+                            "responses": {"200": {"description": "ok"}}}}}
+    c = connector_from_openapi(spec(paths, components={"securitySchemes": schemes}))
+    assert c.action("a").security_sets == [["key", "app"], []]
+    assert c.action("b").security == ["typo"]
+    with ConnectorClient(c, credentials=Credentials()) as cl:
+        assert "X-Key" not in cl.build_request(c.action("a"), {}).headers  # anonymous allowed
+    with ConnectorClient(c, credentials=Credentials(api_key="SECRET")) as cl:
+        r = cl.build_request(c.action("a"), {})  # with a key, both schemes are sent
+        assert r.headers["X-Key"] == "SECRET" and ("app_id", "SECRET") in _query(r)
+        with pytest.raises(ConnectorError, match="typo"):
+            cl.build_request(c.action("b"), {})
+
+
+def test_api_key_per_scheme_from_env(monkeypatch):  # M3
+    monkeypatch.setenv("CONNECTORGEN_API_KEY_APP", "A")
+    monkeypatch.setenv("CONNECTORGEN_API_KEY", "default")
+    creds = Credentials.from_env()
+    assert creds.key_for(AuthScheme(id="App", type="api_key")) == "A"
+    assert creds.key_for(AuthScheme(id="other", type="api_key")) == "default"
+    assert "A" not in repr(creds)
+
+
+def test_param_named_body_is_kept_apart_from_the_request_body():  # M4
+    paths = {"/x": {"post": {"operationId": "mk", "parameters": [
+        {"name": "body", "in": "query", "schema": {"type": "string"}}],
+        "requestBody": {"content": {"application/json": {"schema": {"type": "object"}}}},
+        "responses": {"200": {"description": "ok"}}}}}
+    c = connector_from_openapi(spec(paths))
+    act = c.action("mk")
+    assert set(c.input_schema(act)["properties"]) == {"body_param", "body"}
+    with ConnectorClient(c) as cl:
+        r = cl.build_request(act, {"body_param": "q", "body": {"x": 1}})
+    assert _query(r) == [("body", "q")] and json.loads(r.content) == {"x": 1}
+    assert Connector.model_validate_json(c.model_dump_json()) == c  # survives save/load
+
+
+def test_query_string_in_path_template():  # L7
+    paths = {"/export?mode=csv&fmt={fmt}&id={id}": {"get": {"operationId": "ex", "parameters": [
+        {"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "ok"}}}}}
+    c = connector_from_openapi(spec(paths))
+    act = c.action("ex")
+    assert {(p.name, p.location, p.required) for p in act.params} == {
+        ("id", "query", True), ("fmt", "query", True)}
+    with ConnectorClient(c) as cl:
+        r = cl.build_request(act, {"id": "7", "fmt": "x"})
+    assert r.url.path.endswith("/export") and sorted(_query(r)) == [
+        ("fmt", "x"), ("id", "7"), ("mode", "csv")]
+
+
+def test_server_variable_without_default():  # M10
+    servers = [{"url": "https://{tenant}.acme.test/v1", "variables": {"tenant": {}}}]
+    c = connector_from_openapi(spec(servers=servers))
+    assert c.base_url == "https://{tenant}.acme.test/v1" and "{tenant}" in c.notes[0]
+    servers[0]["variables"]["tenant"] = {"enum": ["eu", "us"]}
+    assert connector_from_openapi(spec(servers=servers)).base_url == "https://eu.acme.test/v1"
+
+
+@pytest.mark.parametrize("pattern,expected", [
+    ("/repos/owner", "/repos/owner"), ("/^[a-z]+$/i", "^[a-z]+$"),
+    ("/abc/", "/abc/"), ("/^a\\/b$/", "^a\\/b$")])
+def test_js_regex_literals_only(pattern, expected):  # L5
+    from connectorgen.ingest.openapi import normalize_schema
+
+    assert normalize_schema({"pattern": pattern})["pattern"] == expected
+
+
+def test_malformed_fields():  # L6
+    paths = {"/x": {"get": {"operationId": 123, "tags": "pets", "summary": 5,
+                            "responses": {"200": {"description": "ok"}}}}}
+    act = connector_from_openapi(spec(paths)).actions[0]
+    assert (act.name, act.operation_id, act.tags, act.summary) == ("123", "123", ["pets"], "5")
+    assert connector_from_openapi(spec(servers=["https://x.test"])).base_url == ""
+    with pytest.raises(UnsupportedSpecError, match="malformed"):
+        connector_from_openapi(spec({"/x": {"get": {"parameters": [
+            {"name": "q", "in": "query", "explode": "yes", "style": 5}],
+            "responses": {"200": {"description": "ok"}}}}}))
+
+
+def test_schema_that_includes_itself():  # M16
+    page = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Page"}}}}
+    paths = {"/p": {"get": {"operationId": "list", "parameters": [
+        {"name": "cursor", "in": "query", "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "ok", **page}}},
+        "post": {"operationId": "make", "requestBody": page,
+                 "responses": {"200": {"description": "ok", **page}}}}}
+    schemas = {"Page": {"allOf": [{"$ref": "#/components/schemas/Page"}, {
+        "type": "object", "properties": {"items": {"type": "array", "items": {
+            "type": "object", "properties": {"id": {"type": "string"}}}},
+            "next": {"type": "string"}}}]}}
+    c = connector_from_openapi(spec(paths, components={"schemas": schemas}))
+    assert c.action("list").pagination.style == "cursor"
+    diff_connectors(c, c)
+    BoundedValidator(c.input_schema(c.action("make"))).is_valid({"body": {"items": []}})
+    with pytest.raises(SchemaTooLarge):
+        BoundedValidator({"$defs": {"A": {"allOf": [{"$ref": "#/$defs/A"}]}},
+                          "$ref": "#/$defs/A"}).is_valid(1)
+
+
+def test_oauth_without_supported_flow_says_to_supply_a_token():  # L9
+    schemes = {"pw": {"type": "oauth2", "flows": {"password": {"tokenUrl": "https://x.test/t",
+                                                               "scopes": {}}}},
+               "oid": {"type": "openIdConnect", "openIdConnectUrl": "https://x.test"}}
+    c = connector_from_openapi(spec(components={"securitySchemes": schemes}))
+    assert all(a.type == "oauth2" and "supply an access token" in a.description for a in c.auth)
+
+
+def _swagger(paths, **extra):
+    return {"swagger": "2.0", "info": {"title": "t", "version": "1"}, "host": "api.acme.test",
+            "paths": paths, **extra}
+
+
+def test_swagger_operation_body_beats_path_body():  # M14
+    def body(name):
+        return {"name": "body", "in": "body",
+                "schema": {"type": "object", "properties": {name: {"type": "string"}}}}
+    s = _swagger({"/pets": {"parameters": [body("PATH")], "post": {
+        "parameters": [body("OP")], "responses": {"200": {"description": ""}}}}})
+    assert list(connector_from_openapi(s).actions[0].body_schema["properties"]) == ["OP"]
+
+
+def test_swagger_refs_that_move_are_copied_in():  # M15
+    ok = {"200": {"description": ""}}
+    s = _swagger({
+        "/a": {"get": {"produces": ["application/vnd.x+json"], "responses": {"200": {
+            "description": "", "schema": {"type": "object", "properties": {"id": {
+                "type": "string"}}}}}},
+               "post": {"parameters": [{"name": "body", "in": "body", "schema": {"type": "object"}},
+                                       {"name": "q", "in": "query", "type": "string"}],
+                        "responses": ok}},
+        "/b": {"get": {"responses": {"200": {"description": "", "schema": {
+            "$ref": "#/paths/~1a/get/responses/200/schema"}}}}},
+        "/c": {"get": {"responses": {"200": {"description": "", "schema": {
+            "$ref": "#/responses/Ok/schema"}}}}},
+        "/d": {"get": {"parameters": [{"$ref": "#/paths/~1a/post/parameters/1"}],
+                       "responses": ok}}},
+        responses={"Ok": {"description": "", "schema": {"type": "array"}}})
+    c = connector_from_openapi(s)
+    assert c.action("get_b").output_schema["properties"] == {"id": {"type": "string"}}
+    assert c.action("get_c").output_schema == {"type": "array"}
+    assert [(p.name, p.location) for p in c.action("get_d").params] == [("q", "query")]
+
+
+def _doc_ep(path, params):
+    return {"name": "getPet", "method": "GET", "path": path, "summary": "", "description": "",
+            "params": [{"name": n, "location": loc, "required": False, "type": "string",
+                        "enum_values": [], "description": ""} for n, loc in params],
+            "body_encoding": "none", "body_schema_json": "", "response_schema_json": "",
+            "body_required": False, "pagination": {"style": "none"}}
+
+
+def test_docs_merge_keeps_one_set_of_names():  # M13
+    a = _build_action(_doc_ep("/pets/{id}", [("id", "path"), ("id", "query"),
+                                             ("Authorization", "header")]))
+    b = _build_action(_doc_ep("/pets/{petId}", [("petId", "path"), ("verbose", "query")]))
+    m = _merge(a, b)
+    assert [(p.name, p.location) for p in m.params] == [("id", "path"), ("verbose", "query")]
+
+
+def test_placeholder_only_paths_need_the_path_in_the_docs():  # L11
+    assert not _grounded("/{id}", "nothing relevant here")
+    assert _grounded("/{id}", "GET /{id} returns the item")

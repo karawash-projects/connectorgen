@@ -19,6 +19,7 @@ from urllib.parse import unquote, urljoin
 
 import httpx
 import yaml
+from pydantic import ValidationError
 
 from ..errors import UnsupportedSpecError
 from ..ir import Action, AuthScheme, Connector, OAuthFlow, Pagination, Param, Trigger, hash_spec
@@ -363,9 +364,9 @@ def normalize_schema(schema: Any) -> Any:
                     seen.add(k)
                     unique.append(v)
             out[key] = unique
-    js = re.fullmatch(r"/(.*)/[a-z]*", out["pattern"]) if isinstance(out.get("pattern"), str) else None
-    if js:  # a JavaScript regex literal: '/^[a-z]+$/' -> '^[a-z]+$'
-        out["pattern"] = js.group(1)
+    js = _js_literal(out["pattern"]) if isinstance(out.get("pattern"), str) else None
+    if js is not None:  # a JavaScript regex literal: '/^[a-z]+$/i' -> '^[a-z]+$'
+        out["pattern"] = js
     if isinstance(out.get("items"), list):
         branches = out.pop("items")
         out["items"] = branches[0] if len(branches) == 1 else {"anyOf": branches}
@@ -391,6 +392,38 @@ def normalize_schema(schema: Any) -> Any:
         if isinstance(out.get("enum"), list) and None not in out["enum"]:
             out["enum"] = [*out["enum"], None]
     return out
+
+
+def _drop_self_reference(schema: Any, ref: str) -> Any:
+    """`Page: {allOf: [{$ref: Page}, {...}]}` says nothing more than `{...}`, but validators
+    and every schema walker would loop on it forever."""
+    if not isinstance(schema, dict):
+        return schema
+    for key in ("allOf", "anyOf", "oneOf"):
+        members = schema.get(key)
+        if isinstance(members, list):
+            kept = [m for m in members if not (isinstance(m, dict) and m.get("$ref") == ref)]
+            if len(kept) < len(members):
+                if kept:
+                    schema[key] = kept
+                else:
+                    del schema[key]
+    return schema
+
+
+def _js_literal(pattern: str) -> str | None:
+    """The body of a JavaScript regex literal ('/^[a-z]+$/i'), or None for an ordinary
+    pattern that just starts and ends with slashes ('/repos/owner')."""
+    m = re.fullmatch(r"/(.+)/([dgimsuvy]*)", pattern, re.S)
+    if not m or len(set(m.group(2))) != len(m.group(2)):
+        return None
+    body = m.group(1)
+    # Unescaped slashes inside mean the slashes are part of the pattern, not delimiters.
+    if re.search(r"(?<!\\)/", re.sub(r"\[[^\]]*\]", "", body)):
+        return None
+    if not (body.startswith("^") or body.endswith("$") or m.group(2)):
+        return None
+    return body
 
 
 def _unescape(part: str) -> str:
@@ -432,7 +465,8 @@ class _Resolver:
         if name not in self.raw_schemas:
             raise UnsupportedSpecError(f"Unresolvable $ref: {SCHEMA_REF_PREFIX}{name}")
         self._building.add(name)
-        self.defs[name] = normalize_schema(self.resolve(self.raw_schemas[name]))
+        self.defs[name] = _drop_self_reference(
+            normalize_schema(self.resolve(self.raw_schemas[name])), DEFS_PREFIX + _escape(name))
         self._building.discard(name)
 
     def resolve(self, node: Any, stack: frozenset[str] = frozenset()) -> Any:
@@ -499,8 +533,8 @@ def snake_case(text: str) -> str:
 
 
 def _action_name(method: str, path: str, op: dict[str, Any]) -> str:
-    if op.get("operationId"):
-        return snake_case(op["operationId"])
+    if op.get("operationId") not in (None, ""):
+        return snake_case(str(op["operationId"]))
     parts = []
     for seg in path.strip("/").split("/"):
         if seg.startswith("{") and seg.endswith("}"):
@@ -511,13 +545,20 @@ def _action_name(method: str, path: str, op: dict[str, Any]) -> str:
 
 
 def _base_url(spec: dict[str, Any], source: str | None) -> str:
-    servers = spec.get("servers") or []
+    servers = [s for s in spec.get("servers") or [] if isinstance(s, dict)
+               and isinstance(s.get("url"), str)] if isinstance(spec.get("servers"), list) else []
     if not servers:
         return ""
     server = servers[0]
-    url = server.get("url", "")
-    for var, meta in (server.get("variables") or {}).items():
-        url = url.replace("{" + var + "}", str(meta.get("default", "")))
+    url = server["url"]
+    variables = server.get("variables")
+    for var, meta in (variables.items() if isinstance(variables, dict) else []):
+        meta = meta if isinstance(meta, dict) else {}
+        value = meta.get("default")
+        if value is None and isinstance(meta.get("enum"), list) and meta["enum"]:
+            value = meta["enum"][0]
+        if value is not None:  # no default: leave {var} so the user is told to fill it in
+            url = url.replace("{" + str(var) + "}", str(value))
     if url and not url.startswith(("http://", "https://")) and source and source.startswith("http"):
         url = urljoin(source, url)
     return url.rstrip("/")
@@ -528,7 +569,7 @@ def _auth_schemes(spec: dict[str, Any]) -> list[AuthScheme]:
     out: list[AuthScheme] = []
     for sid, s in schemes.items():
         stype = s.get("type")
-        desc = s.get("description", "")
+        desc = _text(s.get("description"))
         scheme = str(s.get("scheme", "")).lower()
         if stype == "apiKey":
             out.append(AuthScheme(id=sid, type="api_key", param_name=s.get("name"),
@@ -538,8 +579,15 @@ def _auth_schemes(spec: dict[str, Any]) -> list[AuthScheme]:
         elif stype == "http" and scheme == "basic":
             out.append(AuthScheme(id=sid, type="basic", description=desc))
         elif stype in ("oauth2", "openIdConnect"):
-            out.append(AuthScheme(id=sid, type="oauth2", description=desc,
-                                  oauth_flows=_oauth_flows(s.get("flows") or {})))
+            raw_flows = s.get("flows") if isinstance(s.get("flows"), dict) else {}
+            flows = _oauth_flows(raw_flows)
+            if not flows:  # still usable with a token obtained elsewhere
+                kinds = ", ".join(map(str, raw_flows)) or (
+                    "OpenID Connect" if stype == "openIdConnect" else "none listed")
+                note = (f"Sign-in flow ({kinds}) isn't supported; supply an access token "
+                        "(CONNECTORGEN_TOKEN).")
+                desc = f"{desc} {note}".strip()
+            out.append(AuthScheme(id=sid, type="oauth2", description=desc, oauth_flows=flows))
         else:
             kind = f"{stype} {s.get('scheme')}".strip() if stype == "http" else str(stype)
             out.append(AuthScheme(id=sid, type="unsupported",
@@ -579,7 +627,7 @@ def _webhook_trigger(name: str, item: dict[str, Any], used: set[str],
         name=tname,
         kind="webhook",
         event=name,
-        description=op.get("summary") or op.get("description", "")[:200],
+        description=(_text(op.get("summary")) or _text(op.get("description")))[:200],
         source_action=register_action,
         payload_schema=normalize_schema(schema) if schema is not None else None,
         provenance={"trigger": "openapi"},
@@ -606,13 +654,19 @@ class _Detector:
     def __init__(self, resolver: _Resolver):
         self.r = resolver
 
-    def properties(self, schema: Any) -> dict[str, Any]:
+    def properties(self, schema: Any, seen: frozenset[str] = frozenset()) -> dict[str, Any]:
+        ref = schema.get("$ref") if isinstance(schema, dict) else None
+        if isinstance(ref, str):
+            if ref in seen:
+                return {}  # a schema that includes itself through allOf adds nothing new
+            seen = seen | {ref}
         schema = self.r.deref(schema)
         if not isinstance(schema, dict):
             return {}
-        props = dict(schema.get("properties") or {})
-        for sub in schema.get("allOf") or []:
-            props.update(self.properties(sub))
+        props = dict(schema.get("properties") or {}) \
+            if isinstance(schema.get("properties"), dict) else {}
+        for sub in schema.get("allOf") or [] if isinstance(schema.get("allOf"), list) else []:
+            props.update(self.properties(sub, seen))
         return props
 
     def find_field(self, schema: Any, names: set[str], depth: int = 2) -> str | None:
@@ -684,18 +738,50 @@ class _Detector:
 
 
 def _security(requirements: Any, known: set[str]) -> list[str] | None:
-    """Scheme ids an operation accepts. None when the spec says nothing."""
+    """Scheme ids an operation accepts (any one of them). None when the spec says nothing.
+    A requirement naming only schemes the spec doesn't define gives those names, so calls
+    fail with a clear "needs X credentials" instead of sending default credentials."""
     if requirements is None:
         return None
     if requirements == []:
         return []  # `security: []` = public endpoint, overriding any global requirement
     ids: list[str] = []
+    unknown: list[str] = []
     for req in requirements or []:
         if isinstance(req, dict):
             ids += [k for k in req if k in known and k not in ids]
+            unknown += [str(k) for k in req if k not in known and str(k) not in unknown]
     if not ids and any(isinstance(r, dict) and not r for r in requirements or []):
         return []  # explicitly anonymous
-    return ids or None
+    return ids or unknown or None
+
+
+def _security_sets(requirements: Any, known: set[str]) -> list[list[str]] | None:
+    """The requirement as alternatives that each need all their schemes; [] in the list =
+    anonymous allowed. None when a single-scheme `security` list says it all."""
+    if not isinstance(requirements, list) or not requirements:
+        return None
+    sets: list[list[str]] = []
+    for req in requirements:
+        if not isinstance(req, dict):
+            continue
+        ids = [str(k) for k in req]
+        if all(k in known for k in ids) and ids not in sets:
+            sets.append(ids)
+    if all(len(x) == 1 for x in sets):
+        return None  # plain alternatives: `security` already says this
+    return sets
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else "" if value is None else str(value)
+
+
+def _tags(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    return [str(t) for t in value if isinstance(t, (str, int, float))] \
+        if isinstance(value, list) else []
 
 
 _JSON_TYPES = {"string", "number", "integer", "boolean", "array", "object", "null"}
@@ -711,11 +797,18 @@ def _split_query_template(path: str, params: list[Param],
     for pair in filter(None, query.split("&")):
         key, _, value = pair.partition("=")
         m = re.fullmatch(r"\{([^}]+)\}", value)
+        if m and m.group(1) not in by_name:  # undeclared {x}: a required string query param
+            target = Param(name=m.group(1), location="query", required=True,
+                           json_schema={"type": "string"})
+            params.append(target)
+            by_name[target.name] = target
+            notes.append(f"Query placeholder '{{{m.group(1)}}}' wasn't declared; added as a "
+                         "required string.")
         target = by_name.get(m.group(1)) if m else None
         if target is not None:
             target.location = "query"
-            target.name = key or target.name
-            target.required = target.required
+            if key and key != target.name:
+                target.wire_name = key
         else:
             static.append(pair)
     notes.append("Path template contained a query string; moved its parameters to the query.")
@@ -748,6 +841,9 @@ def connector_from_openapi(
                                        derive_triggers=derive_triggers)
     except RecursionError:
         raise UnsupportedSpecError("Spec is nested too deeply to process.") from None
+    except (TypeError, AttributeError, ValidationError) as e:  # a field of the wrong type
+        raise UnsupportedSpecError(f"Spec has a malformed field ({type(e).__name__}: "
+                                   f"{str(e).splitlines()[0][:200]}).") from None
 
 
 def _connector_from_openapi(
@@ -772,8 +868,8 @@ def _connector_from_openapi(
     detector = _Detector(resolver)
     scheme_ids = set(((spec.get("components") or {}).get("securitySchemes") or {}).keys())
     global_security = spec.get("security")
-    info = spec.get("info") or {}
-    title = info.get("title") or "api"
+    info = spec.get("info") if isinstance(spec.get("info"), dict) else {}
+    title = _text(info.get("title")) or "api"
 
     actions: list[Action] = []
     used: set[str] = set()
@@ -816,7 +912,7 @@ def _connector_from_openapi(
                     location=loc,
                     required=bool(p.get("required")) or loc == "path",
                     json_schema=normalize_schema(schema or {}),
-                    description=p.get("description", ""),
+                    description=_text(p.get("description")),
                     style=p.get("style"),
                     explode=p.get("explode") if isinstance(p.get("explode"), bool) else None,
                 ))
@@ -877,9 +973,9 @@ def _connector_from_openapi(
             upper = method.upper()
             actions.append(Action(
                 name=action_name,
-                operation_id=op.get("operationId"),
-                summary=op.get("summary", ""),
-                description=op.get("description", ""),
+                operation_id=None if op.get("operationId") is None else str(op["operationId"]),
+                summary=_text(op.get("summary")),
+                description=_text(op.get("description")),
                 method=upper,
                 path=op_path,
                 params=params,
@@ -889,9 +985,10 @@ def _connector_from_openapi(
                 output_schema=output_schema,
                 pagination=detector.pagination(upper, params, output_schema, notes),
                 destructive=upper == "DELETE" or bool(DESTRUCTIVE_WORDS.search(action_name)),
-                tags=list(op.get("tags") or []),
+                tags=_tags(op.get("tags")),
                 notes=notes,
                 security=_security(op.get("security", global_security), scheme_ids),
+                security_sets=_security_sets(op.get("security", global_security), scheme_ids),
             ))
 
     # The same rule as docs and MCP connectors: PUT/PATCH/DELETE, and POSTs that say they
@@ -929,7 +1026,7 @@ def _connector_from_openapi(
         name=name or snake_case(title),
         title=title,
         notes=connector_notes,
-        description=info.get("description", ""),
+        description=_text(info.get("description")),
         api_version=str(info.get("version", "")),
         base_url=resolved_base,
         auth=_auth_schemes(spec),

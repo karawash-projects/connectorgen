@@ -255,6 +255,8 @@ class BoundedValidator:
         token = _budget.set([steps, steps, REGEX_TOTAL_SECONDS])
         try:
             return consume(self._validator.iter_errors(instance))
+        except RecursionError:  # e.g. A = {allOf: [A]}: a schema that applies itself forever
+            raise SchemaTooLarge("the schema refers to itself without end") from None
         finally:
             _budget.reset(token)
 

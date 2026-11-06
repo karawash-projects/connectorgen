@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from collections.abc import Iterator
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote
 
 import httpx
 
@@ -157,7 +158,7 @@ class ConnectorClient:
         seen_cursors: set[str] = set()
         using_links = False
         if start_url:
-            request = self._follow_url(request, start_url, self.scheme_for(act))
+            request = self._follow_url(request, start_url, self.schemes_for(act))
             stats["params"] = None
             using_links = p.style != "cursor"
         while True:
@@ -199,7 +200,7 @@ class ConnectorClient:
                     return
                 seen_cursors.add(link_next)
                 using_links = True
-                request = self._follow_url(request, link_next, self.scheme_for(act))
+                request = self._follow_url(request, link_next, self.schemes_for(act))
                 stats["params"] = None
                 continue
             if p.style == "link_header" or using_links:
@@ -217,7 +218,7 @@ class ConnectorClient:
                     return
                 seen_cursors.add(str(nxt))
                 if isinstance(nxt, str) and nxt.startswith(("http://", "https://")):
-                    request = self._follow_url(request, nxt, self.scheme_for(act))  # "next" is a full URL
+                    request = self._follow_url(request, nxt, self.schemes_for(act))  # "next" is a full URL
                     stats["params"] = None
                     continue
                 params[p.request_param] = nxt  # type: ignore[index]
@@ -237,8 +238,9 @@ class ConnectorClient:
         if self.validate:
             self._validate(action, inputs)
 
-        path = action.path
-        query: dict[str, Any] = {}
+        path, _, fixed_query = action.path.partition("?")
+        # Fixed pairs written into the path template (/export?mode=csv) are sent as given.
+        query: dict[str, Any] = dict(parse_qsl(fixed_query, keep_blank_values=True))
         headers: dict[str, str] = {"Accept": "application/json"}
         cookies: dict[str, str] = {}
 
@@ -249,28 +251,26 @@ class ConnectorClient:
                 continue
             value = inputs[p.name]
             if p.location == "path":
-                path = path.replace("{" + p.name + "}", _path_segment(_joined(value, ",")))
+                path = path.replace("{" + p.name + "}", _path_value(action, p, value))
             elif p.location == "query":
-                if isinstance(value, (list, tuple)) and p.explode is False or \
-                        p.style in ("spaceDelimited", "pipeDelimited"):
-                    sep = {"spaceDelimited": " ", "pipeDelimited": "|"}.get(p.style or "", ",")
-                    query[p.name] = _joined(value, sep)
-                else:
-                    query[p.name] = _query_value(value)
+                query.update(_query_pairs(action, p, value))
             else:
-                headers[p.name] = _joined(value, ",")
+                headers[p.sent_name] = _simple(action, p, value)
 
-        scheme = self.scheme_for(action)
-        if scheme is None and action.security:
-            allowed = [s for s in self.connector.auth if s.id in action.security]
+        schemes = self.schemes_for(action)
+        if schemes is None:
+            ids = [s for s in (action.security or [])] if action.security_sets is None else \
+                [" + ".join(x) for x in action.security_sets if x]
+            allowed = [s for s in self.connector.auth if s.id in (action.security or [])]
             if allowed and all(s.type == "unsupported" for s in allowed):
                 raise ConnectorError(
                     f"'{action.name}' uses auth connectorgen can't perform yet "
                     f"({'; '.join(s.description for s in allowed)}).")
             raise ConnectorError(
-                f"'{action.name}' requires {' or '.join(action.security)} credentials, "
+                f"'{action.name}' requires {' or '.join(ids) or 'some'} credentials, "
                 "which weren't provided.")
-        apply_auth(scheme, self.credentials, headers, query, cookies)
+        for scheme in schemes:
+            apply_auth(scheme, self.credentials, headers, query, cookies)
 
         kwargs: dict[str, Any] = {"params": query, "headers": headers}
         if cookies:
@@ -329,8 +329,26 @@ class ConnectorClient:
         if error is not None:
             raise InputValidationError(action.name, error.message, list(error.path))
 
+    def schemes_for(self, action: Action) -> list[Any] | None:
+        """All auth schemes to apply for this action: the first requirement set whose
+        schemes the credentials all satisfy ([] for anonymous). None = none satisfied."""
+        if action.security_sets is not None:
+            for want in sorted(action.security_sets, key=lambda x: not x):  # authenticated first
+                schemes = [s for s in self.connector.auth if s.id in want]
+                if len(schemes) == len(want) and all(
+                        self.credentials is not None and self.credentials.satisfies(s) for s in schemes):
+                    return schemes
+            return None
+        one = self.scheme_for(action)
+        if one is not None:
+            return [one]
+        return [] if (action.security == [] or action.security is None) else None
+
     def scheme_for(self, action: Action) -> Any:
-        """The auth scheme to use for this action (per-operation security), or None."""
+        """The (first) auth scheme to use for this action (per-operation security), or None."""
+        if action.security_sets is not None:
+            schemes = self.schemes_for(action)
+            return schemes[0] if schemes else None
         if action.security is None:
             return self.scheme
         if not action.security:
@@ -341,7 +359,9 @@ class ConnectorClient:
         return pick_scheme(allowed, self.credentials)
 
     def _follow_url(self, previous: httpx.Request, url: str, scheme: Any = None) -> httpx.Request:
-        """GET a server-provided next-page URL, keeping headers and query-string auth.
+        """Request a server-provided next-page URL the way the previous page was requested
+        (same method and body: a POST search keeps its filters), keeping headers and
+        query-string auth.
         Only URLs on the API's own origin (scheme, host and port) are followed: a hostile or
         compromised API must not be able to send our credentials somewhere else."""
         try:
@@ -355,10 +375,16 @@ class ConnectorClient:
             raise ConnectorError(
                 f"Refusing to follow a next-page URL on another origin ({redact_url(target)}); "
                 f"credentials are only sent to {self.base_url}.")
-        if (scheme and scheme.type == "api_key" and scheme.location == "query"
-                and scheme.param_name not in target.params and self.credentials):
-            target = target.copy_merge_params({scheme.param_name: self.credentials.api_key})
-        return self.http.build_request("GET", target, headers=previous.headers)
+        for sc in (scheme if isinstance(scheme, list) else [scheme] if scheme else []):
+            if (sc.type == "api_key" and sc.location == "query"
+                    and sc.param_name not in target.params and self.credentials):
+                target = target.copy_merge_params({sc.param_name: self.credentials.key_for(sc)})
+        headers = httpx.Headers(previous.headers)
+        headers.pop("content-length", None)  # recomputed for the body below
+        content = previous.read() if previous.method != "GET" else b""
+        if not content:
+            headers.pop("content-type", None)
+        return self.http.build_request(previous.method, target, headers=headers, content=content or None)
 
     def _send_raw(self, action: Action, request: httpx.Request) -> tuple[Any, httpx.Response]:
         policy = self.retry
@@ -490,6 +516,80 @@ def _path_segment(value: str) -> str:
     if encoded in (".", ".."):
         encoded = encoded.replace(".", "%2E")
     return encoded
+
+
+def _unsupported_style(action: Action, p: Any, value: Any) -> ConnectorError:
+    kind = "an object" if isinstance(value, dict) else "a list" if isinstance(value, (list, tuple)) else "a value"
+    return ConnectorError(f"'{action.name}': can't send {kind} for {p.location} param '{p.name}' "
+                          f"with style '{p.style}'.")
+
+
+def _query_pairs(action: Action, p: Any, value: Any) -> dict[str, Any]:
+    """OpenAPI query serialization. Objects: form+explode -> ?a=1&b=2, form -> ?name=a,1,b,2,
+    deepObject -> ?name[a]=1 (nested: name[a][b]); arrays: repeated keys, or joined."""
+    style = p.style or "form"
+    explode = p.explode if p.explode is not None else style == "form" or style == "deepObject"
+    if style == "deepObject":
+        if not isinstance(value, dict):
+            raise _unsupported_style(action, p, value)
+        return {k: _query_value(v) for k, v in _flatten_form({p.sent_name: value}).items()}
+    if style in ("spaceDelimited", "pipeDelimited"):
+        sep = " " if style == "spaceDelimited" else "|"
+        if isinstance(value, dict):
+            return {p.sent_name: sep.join(f"{k}{sep}{_scalar(v)}" for k, v in value.items())}
+        return {p.sent_name: _joined(value, sep)}
+    if style != "form":
+        raise _unsupported_style(action, p, value)
+    if isinstance(value, dict):
+        if explode:
+            return {str(k): _query_value(v) if not isinstance(v, (dict, list, tuple)) else _scalar(v)
+                    for k, v in value.items()}
+        return {p.sent_name: ",".join(f"{k},{_scalar(v)}" for k, v in value.items())}
+    if isinstance(value, (list, tuple)) and not explode:
+        return {p.sent_name: _joined(value, ",")}
+    return {p.sent_name: _query_value(value)}
+
+
+def _simple(action: Action, p: Any, value: Any) -> str:
+    """Header/path `simple` style: lists a,b; objects a,1,b,2 (explode: a=1,b=2)."""
+    if p.style not in (None, "simple"):
+        raise _unsupported_style(action, p, value)
+    if isinstance(value, dict):
+        sep = "=" if p.explode else ","
+        return ",".join(f"{k}{sep}{_scalar(v)}" for k, v in value.items())
+    return _joined(value, ",")
+
+
+def _path_value(action: Action, p: Any, value: Any) -> str:
+    """Path params: simple (default), label (.a.b / .a,b) or matrix (;id=a;id=b / ;id=a,b);
+    always percent-encoded so the value stays inside its segment."""
+    style = p.style or "simple"
+    if style == "simple":
+        return _path_segment(_simple(action, p, value))
+    if style not in ("label", "matrix"):
+        raise _unsupported_style(action, p, value)
+    enc = _path_segment
+    if isinstance(value, dict):
+        items = [(str(k), _scalar(v)) for k, v in value.items()]
+        if p.explode:
+            parts = [f"{enc(k)}={enc(v)}" for k, v in items]
+            return ("." if style == "label" else ";") + ("." if style == "label" else ";").join(parts)
+        flat = ",".join(f"{enc(k)},{enc(v)}" for k, v in items)
+        return "." + flat if style == "label" else f";{enc(p.name)}={flat}"
+    values = [_scalar(v) for v in value] if isinstance(value, (list, tuple)) else [_scalar(value)]
+    if style == "label":
+        return "." + ("." if p.explode else ",").join(enc(v) for v in values)
+    if p.explode:
+        return "".join(f";{enc(p.name)}={enc(v)}" for v in values)
+    return f";{enc(p.name)}=" + ",".join(enc(v) for v in values)
+
+
+def _scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, separators=(",", ":"))  # nested beyond what the style can say
+    return str(value)
 
 
 def _joined(value: Any, sep: str) -> str:

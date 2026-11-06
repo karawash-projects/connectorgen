@@ -22,13 +22,19 @@ class Credentials:
 
     api_key: str | None = None
     token: str | None = None
+    # One API key per scheme id, for APIs that need several at once (an app key and a
+    # user key). Falls back to `api_key`.
+    api_keys: dict[str, str] | None = None
     username: str | None = None
     password: str | None = None
     oauth: OAuth2Session | None = None
 
     @classmethod
     def from_env(cls, prefix: str = "CONNECTORGEN_") -> Credentials:
+        keyed = {k[len(f"{prefix}API_KEY_"):].lower(): v for k, v in os.environ.items()
+                 if k.startswith(f"{prefix}API_KEY_") and v}
         return cls(
+            api_keys=keyed or None,
             api_key=os.environ.get(f"{prefix}API_KEY"),
             token=os.environ.get(f"{prefix}TOKEN"),
             username=os.environ.get(f"{prefix}USERNAME"),
@@ -36,15 +42,23 @@ class Credentials:
         )
 
     def __repr__(self) -> str:  # never print secrets
-        present = [n for n in ("api_key", "token", "username", "password", "oauth")
+        present = [n for n in ("api_key", "api_keys", "token", "username", "password", "oauth")
                    if getattr(self, n) is not None]
         return f"Credentials(<set: {', '.join(present) or 'none'}>)"
 
     __str__ = __repr__
 
+    def key_for(self, scheme: AuthScheme) -> str | None:
+        """The API key for this scheme: api_keys[scheme id] (any case), else api_key."""
+        if self.api_keys:
+            for k, v in self.api_keys.items():
+                if k.lower() == scheme.id.lower() and v:
+                    return v
+        return self.api_key
+
     def satisfies(self, scheme: AuthScheme) -> bool:
         if scheme.type == "api_key":
-            return bool(self.api_key and scheme.param_name)
+            return bool(self.key_for(scheme) and scheme.param_name)
         if scheme.type == "oauth2":
             return bool(self.token or self.oauth)
         if scheme.type == "bearer":
@@ -74,13 +88,14 @@ def apply_auth(scheme: AuthScheme | None, creds: Credentials | None,
     if scheme is None or creds is None:
         return
     if scheme.type == "api_key":
-        assert scheme.param_name and creds.api_key
+        key = creds.key_for(scheme)
+        assert scheme.param_name and key
         if scheme.location == "query":
-            query[scheme.param_name] = creds.api_key
+            query[scheme.param_name] = key
         elif scheme.location == "cookie":
-            cookies[scheme.param_name] = creds.api_key
+            cookies[scheme.param_name] = key
         else:
-            headers[scheme.param_name] = creds.api_key
+            headers[scheme.param_name] = key
     elif scheme.type == "oauth2" and creds.oauth is not None:
         headers["Authorization"] = f"Bearer {creds.oauth.access_token()}"
     elif scheme.type in ("bearer", "oauth2"):

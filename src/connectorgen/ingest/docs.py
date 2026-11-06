@@ -328,6 +328,8 @@ def _grounded(path: str, chunk: str) -> bool:
     ground any endpoint that reuses its segments."""
     haystack = re.sub(r"^\[source: [^\]\n]*\]\n?", "", chunk).lower()
     literal = [seg for seg in path.strip("/").split("/") if seg and not seg.startswith("{")]
+    if not literal:  # "/{id}" alone grounds nothing: the docs must show that path itself
+        return path.lower() in haystack
     return all(re.search(r"(?<![a-z0-9_-])" + re.escape(seg.lower()) + r"(?![a-z0-9_-])", haystack)
                for seg in literal)
 
@@ -474,6 +476,7 @@ def _build_action(ep: dict[str, Any]) -> Action:
     placeholders = re.findall(r"\{([^}]+)\}", path)
     params: list[Param] = []
     seen: set[tuple[str, str]] = set()
+    names: set[str] = set(placeholders)  # path params win a name clash
     for p in ep["params"]:
         key = (p["name"], p["location"])
         if key in seen or not p["name"]:
@@ -482,6 +485,16 @@ def _build_action(ep: dict[str, Any]) -> Action:
         if p["location"] == "path" and p["name"] not in placeholders:
             notes.append(f"Path param '{p['name']}' isn't in the path; dropped.")
             continue
+        if p["location"] == "header" and p["name"].lower() in _NOT_PARAM_HEADERS:
+            notes.append(f"Header '{p['name']}' dropped: auth and encoding headers are set "
+                         "by the runtime.")
+            continue
+        if p["location"] != "path":
+            if p["name"] in names:
+                notes.append(f"{p['location'].capitalize()} param '{p['name']}' has the same "
+                             "name as another param; dropped.")
+                continue
+            names.add(p["name"])
         schema: dict[str, Any] = {"type": p["type"]}
         if p["type"] == "array":
             schema["items"] = {"type": "string"}
@@ -526,10 +539,26 @@ def _build_action(ep: dict[str, Any]) -> Action:
     )
 
 
+_NOT_PARAM_HEADERS = {"authorization", "proxy-authorization", "cookie", "content-type",
+                      "content-length", "host", "connection", "accept-encoding",
+                      "transfer-encoding"}
+
+
 def _merge(existing: Action, new: Action) -> Action:
-    """Same endpoint documented in two chunks: keep the richer of each part."""
-    have = {(p.name, p.location) for p in existing.params}
-    existing.params += [p for p in new.params if (p.name, p.location) not in have]
+    """Same endpoint documented in two chunks: keep the richer of each part. The chunks may
+    name the placeholders differently (/pets/{id}, /pets/{petId}): the first names win."""
+    renames = dict(zip(re.findall(r"\{([^}]+)\}", new.path),
+                       re.findall(r"\{([^}]+)\}", existing.path)))
+    have = {p.name for p in existing.params}
+    for p in new.params:
+        if p.location == "path":
+            if renames.get(p.name, p.name) in have:
+                continue
+            p = p.model_copy(update={"name": renames.get(p.name, p.name)})
+        elif p.name in have:
+            continue
+        existing.params.append(p)
+        have.add(p.name)
     for attr in ("summary", "description"):
         if len(getattr(new, attr)) > len(getattr(existing, attr)):
             setattr(existing, attr, getattr(new, attr))
@@ -627,6 +656,16 @@ def connector_from_docs(
             unique_auth.append(item)
     auth, problems = auth_from_proposal(unique_auth, prefix="docs")
     connector_notes += problems
+    # A documented `X-Api-Key` header or `api_key` query param is the credential itself:
+    # it comes from the auth scheme, not from the caller's inputs.
+    credential_params = {((s.location or "header"), (s.param_name or "").lower())
+                         for s in auth if s.type == "api_key" and s.param_name}
+    for act in actions.values():
+        kept = [p for p in act.params
+                if (p.location, p.name.lower()) not in credential_params]
+        if len(kept) < len(act.params):
+            act.notes.append("Credential parameter dropped: it comes from the auth scheme.")
+            act.params = kept
 
     title = max(set(titles), key=titles.count) if titles else (name or "api")
     report.kept = len(actions)
