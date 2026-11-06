@@ -135,14 +135,18 @@ def match_actions(old: Connector, new: Connector) -> tuple[list[tuple[Action, Ac
     take(identity, "identity")
     take(_route, "same endpoint, renamed operation")
     take(lambda a: a.name, "same name")
-    # MCP tools renamed upstream: identical arguments and a near-identical description
+    # MCP tools renamed upstream: identical arguments, the same safety flags and a
+    # near-identical, real description. A guess, so it's always reported for review.
     for a in list(rest_old):
-        if not a.mcp_tool:
+        if not a.mcp_tool or len(a.description.strip()) < MIN_RENAME_DESCRIPTION:
             continue
         for b in rest_new:
-            if b.mcp_tool and _canon(a.arguments_schema) == _canon(b.arguments_schema) and \
-                    difflib.SequenceMatcher(None, a.description, b.description).ratio() >= 0.85:
-                pairs.append((a, b, "same arguments and description, renamed tool"))
+            if b.mcp_tool and len(b.description.strip()) >= MIN_RENAME_DESCRIPTION \
+                    and _canon(a.arguments_schema) == _canon(b.arguments_schema) \
+                    and (a.safe, a.destructive) == (b.safe, b.destructive) \
+                    and _canon(a.mcp_annotations) == _canon(b.mcp_annotations) \
+                    and difflib.SequenceMatcher(None, a.description, b.description).ratio() >= 0.85:
+                pairs.append((a, b, FUZZY_RENAME))
                 rest_old.remove(a)
                 rest_new.remove(b)
                 break
@@ -150,6 +154,10 @@ def match_actions(old: Connector, new: Connector) -> tuple[list[tuple[Action, Ac
 
 
 # ------------------------------------------------------------------ schema shape
+
+
+FUZZY_RENAME = "same arguments and description, renamed tool"
+MIN_RENAME_DESCRIPTION = 20  # characters; empty or tiny descriptions say nothing about identity
 
 
 def _canon(schema: Any) -> str:
@@ -368,17 +376,17 @@ def _compare_input_object(diff: ConnectorDiff, target: str, label: str, old: Any
         diff.add("breaking", target, f"{label}_field_removed",
                  f"{label} field '{name}' removed (inputs that set it will be rejected)")
     for name in sorted(op.keys() & np_.keys()):
-        if _type_of(op[name]) != _type_of(np_[name]) and _type_of(op[name]) is not None:
-            diff.add("breaking", target, f"{label}_field_type_changed",
-                     f"{label} field '{name}' type {_type_of(op[name])} -> {_type_of(np_[name])}",
-                     _type_of(op[name]), _type_of(np_[name]))
-        elif name in nreq and name not in oreq:
+        # Required-ness and the field's own schema are separate questions: a field can become
+        # optional *and* lose accepted values at once, so both are always checked.
+        if name in nreq and name not in oreq:
             diff.add("breaking", target, f"{label}_field_now_required",
                      f"{label} field '{name}' is now required")
         elif name in oreq and name not in nreq:
             diff.add("additive", target, f"{label}_field_now_optional",
                      f"{label} field '{name}' is now optional")
-        elif _canon(op[name]) != _canon(np_[name]):
+        if _canon(op[name]) != _canon(np_[name]):
+            # classify_nested handles type changes too, and knows widening (integer ->
+            # [integer, null]) accepts everything that worked before
             _add_worst(diff, target, f"{label}_field_changed", f"{label} field '{name}': ",
                        classify_nested(op[name], np_[name], name))
 
@@ -499,6 +507,10 @@ def _compare_actions(diff: ConnectorDiff, old: Action, new: Action, old_c: Conne
                  f"upstream name is now '{new.name}' ({how}); the old name keeps working as an alias",
                  old.name, new.name)
         diff.renamed.append((old.name, new.name, how))
+    if how == FUZZY_RENAME:
+        diff.add("review", t, "fuzzy_rename",
+                 f"matched to tool '{new.mcp_tool}' only by its arguments and description; "
+                 "confirm it's the same tool before applying")
     if (old.method, old.path) != (new.method, new.path) and not old.mcp_tool:
         # Only placeholder names changing (/items/{id} -> /items/{itemId}) is bookkeeping;
         # any other move means existing workflows would call a different endpoint.
@@ -560,14 +572,18 @@ def _compare_actions(diff: ConnectorDiff, old: Action, new: Action, old_c: Conne
 
     _compare_output(diff, t, old.output_schema, new.output_schema, old_c.schemas, new_c.schemas)
 
+    # Safety flags decide what smoke tests call and what serve/call allow, so any change
+    # in either direction needs a person to look (a tool that "became" read-only could be
+    # a destructive one that lost its annotation).
     if new.destructive and not old.destructive:
         diff.add("review", t, "became_destructive", "now flagged destructive")
-    elif old.safe and not new.safe:
+    elif old.destructive and not new.destructive:
+        diff.add("review", t, "no_longer_destructive", "no longer flagged destructive")
+    if old.safe and not new.safe:
         diff.add("review", t, "no_longer_read_only", "no longer read-only")
     elif new.safe and not old.safe:
-        diff.add("info", t, "now_read_only", "now read-only")
-    # None = not recorded (e.g. a connector from an older version): unknown, not a change
-    if old.security is not None and old.security != new.security:
+        diff.add("review", t, "now_read_only", "now read-only (smoke tests would start calling it)")
+    if old.security != new.security:
         diff.add("review", t, "security_changed",
                  f"accepted auth {old.security if old.security is not None else 'any'} -> "
                  f"{new.security if new.security is not None else 'any'}")

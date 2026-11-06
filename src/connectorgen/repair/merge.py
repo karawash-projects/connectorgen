@@ -6,7 +6,10 @@ current connector we keep what was added *locally*:
 - aliases, and summaries/descriptions/pagination filled by enrichment where the new
   spec still leaves them empty
 - auth inferred by enrichment when the spec still declares none
-- the base URL (often a local override) and the MCP launch config
+- a base URL set with --base-url (an upstream move of the spec's own URL is adopted, and
+  flagged for review), and the MCP launch config
+- a destructive flag set on an action (locally or by an earlier spec): it's never dropped
+  silently, since it gates `call`, `serve` and smoke tests
 - trigger names and their local config (webhook signing, delivery-id header, inputs),
   plus triggers added by hand whose source action still exists
 - fixes learned from the live API (repair/live.py), re-applied where the new spec
@@ -27,10 +30,17 @@ def carry_over(current: Connector, candidate: Connector, diff: ConnectorDiff) ->
     notes: list[str] = []
 
     if current.base_url and current.base_url != merged.base_url:
-        if merged.base_url:
-            notes.append(f"Kept base URL {current.base_url} (spec says {merged.base_url}).")
-            merged.provenance["spec_base_url"] = merged.base_url
-        merged.base_url = current.base_url
+        recorded = current.provenance.get("spec_base_url")
+        # Overridden: set with --base-url or edited by hand (differs from the spec URL it was
+        # built from). Unknown for connectors that didn't record it: keep it, to be safe.
+        overridden = recorded is None or current.base_url != recorded.rstrip("/") or not merged.base_url
+        if overridden:
+            if merged.base_url:
+                notes.append(f"Kept base URL {current.base_url} (spec says {merged.base_url}).")
+                merged.provenance["spec_base_url"] = merged.base_url
+            merged.base_url = current.base_url
+        else:
+            notes.append(f"Base URL follows the spec: {current.base_url} -> {merged.base_url}.")
     if current.mcp is not None:
         merged.mcp = current.mcp.model_copy(deep=True)
     if not merged.auth and current.auth:
@@ -70,6 +80,10 @@ def carry_over(current: Connector, candidate: Connector, diff: ConnectorDiff) ->
             new.notes = [n for n in new.notes if not any(k in n.lower() for k in _PAGINATION_NOTE)]
         if "name" in old.provenance:
             new.provenance["name"] = old.provenance["name"]
+        if old.destructive and not new.destructive:
+            new.destructive = True
+            notes.append(f"Kept '{final}' flagged destructive (the new version doesn't say so); "
+                         "edit the connector to clear it if that's intended.")
         notes += reapply_live_fixes(old, new)
         notes += reapply_output(merged, new)
 

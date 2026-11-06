@@ -7,6 +7,17 @@ class ConnectorError(Exception):
     """Base class for all connectorgen errors."""
 
 
+class UnknownActionError(ConnectorError, KeyError):
+    """No action (or alias) by that name. Also a KeyError, for code written against 0.9.0."""
+
+    def __str__(self) -> str:  # KeyError would show the message in quotes
+        return str(self.args[0]) if self.args else ""
+
+
+class InvalidConnectorError(ConnectorError):
+    """A connector file can't be read: malformed JSON, wrong shape, or a newer format."""
+
+
 class UnsupportedSpecError(ConnectorError):
     """The source spec uses something this version can't handle."""
 

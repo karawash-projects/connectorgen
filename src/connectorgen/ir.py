@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
 IR_VERSION = "1"
 
@@ -241,7 +241,15 @@ class Trigger(BaseModel):
 
 
 class Connector(BaseModel):
+    _loaded_sha: str | None = PrivateAttr(default=None)  # sha256 of the file it was loaded from
     ir_version: str = IR_VERSION
+
+    def __eq__(self, other: object) -> bool:  # content only, not where it was loaded from
+        if not isinstance(other, Connector):
+            return NotImplemented
+        return self.__dict__ == other.__dict__
+
+    __hash__ = None  # type: ignore[assignment]
     name: str
     title: str = ""
     description: str = ""
@@ -269,8 +277,10 @@ class Connector(BaseModel):
         for a in self.actions:
             if name in a.aliases:
                 return a
+        from .errors import UnknownActionError
+
         available = ", ".join(a.name for a in self.actions) or "(none)"
-        raise KeyError(f"No action named '{name}'. Available: {available}")
+        raise UnknownActionError(f"No action named '{name}'. Available: {available}")
 
     def input_schema(self, action: str | Action, *, prune: bool = False) -> dict[str, Any]:
         """An action's input schema, self-contained (shared schemas attached as $defs).
@@ -284,11 +294,51 @@ class Connector(BaseModel):
         return schema
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(self.model_dump_json(indent=2, exclude_defaults=False) + "\n")
+        """Write atomically (a crash mid-write never leaves a truncated connector), keeping
+        an existing file's permissions."""
+        write_atomic(path, self.model_dump_json(indent=2, exclude_defaults=False) + "\n")
 
     @classmethod
     def load(cls, path: str | Path) -> Connector:
-        return cls.model_validate_json(Path(path).read_text())
+        """Read a connector file. Remembers a hash of the exact bytes read, so a later
+        `apply` can tell whether the file changed in the meantime."""
+        import hashlib
+
+        from .errors import InvalidConnectorError
+
+        raw = Path(path).read_bytes()
+        try:
+            connector = cls.model_validate_json(raw)
+        except ValidationError as e:
+            first = e.errors()[0] if e.errors() else {}
+            where = ".".join(map(str, first.get("loc", ()))) or "file"
+            raise InvalidConnectorError(f"{path} isn't a valid connector ({where}: "
+                                        f"{first.get('msg', e)}).") from None
+        major = str(connector.ir_version).split(".")[0]
+        if major != IR_VERSION.split(".")[0]:
+            raise InvalidConnectorError(
+                f"{path} uses connector format {connector.ir_version}; this version of connectorgen "
+                f"reads format {IR_VERSION}. Upgrade connectorgen, or regenerate the connector.")
+        connector._loaded_sha = hashlib.sha256(raw).hexdigest()
+        return connector
+
+
+def write_atomic(path: str | Path, text: str) -> None:
+    """Replace a file's contents atomically, keeping its permissions if it exists."""
+    import os
+    import tempfile
+
+    target = Path(path)
+    mode = target.stat().st_mode & 0o7777 if target.exists() else None
+    fd, tmp = tempfile.mkstemp(dir=target.parent or ".", prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode if mode is not None else 0o644)  # mkstemp's 0600 would hide it
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def referenced_defs(schema: Any, defs: dict[str, Any]) -> dict[str, Any]:

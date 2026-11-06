@@ -226,7 +226,7 @@ class TestSystem:
         assert "jane" not in raw and '"3h"' not in raw                # no response data saved
 
         r = cg(env, "check", "taskly.json", "--smoke-report", "smoke.json", "--fix-live",
-               "--verify-live", "-o", "fix", expect=20)
+               "--verify-live", "--yes", "-o", "fix", expect=20)
         assert "+ get_task (output, live)" in r.stdout
         assert "pass a model to diagnose it" in r.stdout                # input fix needs a model
         cg(env, "apply", "fix", "taskly.json", "--yes")

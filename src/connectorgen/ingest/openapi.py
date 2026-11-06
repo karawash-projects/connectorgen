@@ -819,6 +819,13 @@ def _connector_from_openapi(
                 security=_security(op.get("security", global_security), scheme_ids),
             ))
 
+    # The same rule as docs and MCP connectors: PUT/PATCH/DELETE, and POSTs that say they
+    # destroy, revoke, refund, ... (the action name alone misses replaceUserSettings, refunds).
+    from .destructive import action_destructive
+
+    for act in actions:
+        act.destructive = act.destructive or action_destructive(act)
+
     webhooks = {**(spec.get("x-webhooks") or {}), **(spec.get("webhooks") or {})}
     for event, raw in webhooks.items():  # OpenAPI 3.1 `webhooks`, or the 3.0-era `x-webhooks`
         item = resolver.resolve(raw)
@@ -857,8 +864,10 @@ def _connector_from_openapi(
         source=source_str,
         spec_hash=hash_spec(spec),
     )
-    if base_url and spec_base and spec_base != resolved_base:
-        connector.provenance["spec_base_url"] = spec_base  # so `check` doesn't flag the override
+    if spec_base:
+        # The spec's own server URL, so `check` can tell an override (--base-url, or the file
+        # edited by hand) from the spec moving its URL.
+        connector.provenance["spec_base_url"] = spec_base
     if derive_triggers:
         from ..triggers.derive import derive_polling_triggers
 

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..errors import ConnectorError
-from ..ir import Connector, hash_spec
+from ..ir import Connector, write_atomic, hash_spec
 from ..runtime.auth import Credentials
 from ..validate.contract import run_contract_tests
 from .diff import ConnectorDiff, DiffEntry, diff_connectors
@@ -88,15 +88,19 @@ class RepairProposal:
         return "\n".join(lines)
 
     def save(self, directory: str | Path) -> Path:
+        """Write proposal.json, candidate.json and summary.txt atomically. proposal.json
+        records the candidate's hash, so a candidate swapped after review is refused."""
         d = Path(directory)
         d.mkdir(parents=True, exist_ok=True)
         meta = {k: v for k, v in self.__dict__.items() if k not in ("diff", "candidate")}
         meta["diff"] = self.diff.to_dict()
         meta["has_candidate"] = self.candidate is not None
-        (d / "proposal.json").write_text(json.dumps(meta, indent=2, default=str))
         if self.candidate is not None:
-            self.candidate.save(d / "candidate.json")
-        (d / "summary.txt").write_text(self.to_text() + "\n")
+            text = self.candidate.model_dump_json(indent=2, exclude_defaults=False) + "\n"
+            write_atomic(d / "candidate.json", text)
+            meta["candidate_sha"] = hashlib.sha256(text.encode()).hexdigest()
+        write_atomic(d / "proposal.json", json.dumps(meta, indent=2, default=str))
+        write_atomic(d / "summary.txt", self.to_text() + "\n")
         return d
 
     @classmethod
@@ -104,8 +108,14 @@ class RepairProposal:
         d = Path(directory)
         meta = json.loads((d / "proposal.json").read_text())
         has_candidate = meta.pop("has_candidate", False)
+        expected = meta.pop("candidate_sha", None)
         diff = ConnectorDiff.from_dict(meta.pop("diff", {}))
-        candidate = Connector.load(d / "candidate.json") if has_candidate else None
+        candidate = None
+        if has_candidate:
+            if expected and file_sha(d / "candidate.json") != expected:
+                raise ConnectorError(f"{d / 'candidate.json'} was changed after the proposal was "
+                                     "made; run `check` again.")
+            candidate = Connector.load(d / "candidate.json")
         return cls(**meta, diff=diff, candidate=candidate)
 
 
@@ -224,7 +234,7 @@ def check_for_drift(
     used_actions: list[str] | None = None,
     current_path: str | Path | None = None,
     fix_live: bool = False,
-    verify_live: bool = False,
+    verify_live: bool | Any = False,
     global_params: dict[str, Any] | None = None,
 ) -> RepairProposal:
     """Re-read the connector's source and build a proposal. Never modifies anything.
@@ -232,8 +242,13 @@ def check_for_drift(
     fix_live: when the source is unchanged but the smoke report shows the live API
         disagreeing with it, propose fixes (repair/live.py). Request rejections need `llm`.
     verify_live: re-call the API (read-only) to confirm each live fix; uses `credentials`
-        and `global_params` (the same --param values given to smoke)."""
+        and `global_params` (the same --param values given to smoke). Pass a callable to
+        approve the proposed fixes before any request is sent (see propose_live_fixes)."""
     kind = source_kind(connector)
+    # The hash `apply` compares against: the bytes this connector was loaded from (or, failing
+    # that, the file as it is now, before the slow regeneration), so edits made while `check`
+    # runs are never overwritten.
+    loaded_sha = connector._loaded_sha or (file_sha(current_path) if current_path else None)
     candidate, new_hash, notes = _regenerate(connector, kind, spec=spec, credentials=credentials,
                                              env=env, llm=llm)
     used = set(used_actions or [])
@@ -250,7 +265,7 @@ def check_for_drift(
         source=connector.source if kind != "mcp" else (connector.mcp.describe() if connector.mcp else None),
         verdict="no_change", current_hash=connector.spec_hash, new_hash=new_hash, notes=notes,
         live_findings=[f"{a}: {d}" for a, d in live],
-        current_file_sha=file_sha(current_path) if current_path else None,
+        current_file_sha=loaded_sha,
     )
     if candidate is None and fix_live and smoke and new_hash == connector.spec_hash:
         from .live import propose_live_fixes
@@ -321,6 +336,11 @@ def apply_proposal(directory: str | Path, connector_path: str | Path, *,
     if proposal.candidate is None or not proposal.has_update:
         raise ConnectorError(f"Nothing to apply (verdict: {proposal.verdict}).")
     path = Path(connector_path)
+    if not proposal.current_file_sha and not force:
+        raise ConnectorError("This proposal doesn't record which version of the connector it was "
+                             "made from, so applying it could overwrite changes. Run `check` on "
+                             "the connector file (or load it with Connector.load), or pass "
+                             "force=True.")
     if proposal.current_file_sha and file_sha(path) != proposal.current_file_sha and not force:
         raise ConnectorError(f"{path} changed after this proposal was made; run the check again "
                              "(or force=True to overwrite those changes).")

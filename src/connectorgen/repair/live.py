@@ -24,7 +24,9 @@ re-applied when the connector is regenerated from a newer spec.
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -280,15 +282,54 @@ def _param_schema(op: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def apply_input_ops(act: Action, ops: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+# Names a model may introduce. Proposals come from a model reading text the API sent, so a
+# hostile API could try to steer it: only plain parameter names are accepted, and never a
+# header that changes how a request is authenticated, routed or interpreted.
+_SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-\[\]]{0,63}$")
+FORBIDDEN_HEADERS = {
+    "authorization", "proxy-authorization", "cookie", "set-cookie", "host", "content-length",
+    "content-type", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade",
+    "expect", "forwarded", "origin", "referer", "x-http-method-override", "x-http-method",
+    "x-method-override", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
+    "x-original-url", "x-rewrite-url", "x-api-key", "api-key", "x-auth-token",
+}
+
+
+def credential_names(c: Connector) -> set[str]:
+    """Lower-cased names this connector puts credentials in (API-key headers/params)."""
+    return {s.param_name.lower() for s in c.auth if s.param_name}
+
+
+def _name_problem(name: str, location: str | None, forbidden: set[str]) -> str | None:
+    if not _SAFE_NAME.match(name):
+        return f"refused name {name[:40]!r}: not a plain parameter name"
+    low = name.lower()
+    if low in forbidden or (location == "header" and (low in FORBIDDEN_HEADERS or "auth" in low
+                                                       or low.startswith(("proxy-", "sec-")))):
+        return f"refused {location or 'input'} '{name}': it would change how requests are authenticated or routed"
+    return None
+
+
+def apply_input_ops(act: Action, ops: list[dict[str, Any]], *,
+                    forbidden: set[str] | None = None) -> tuple[list[str], list[str]]:
     """Apply patch operations to an action's inputs (params, or an MCP tool's arguments).
-    Idempotent: operations that are already satisfied are skipped. Returns (changes, problems)."""
+    Idempotent: operations that are already satisfied are skipped. Returns (changes, problems).
+    forbidden: extra names (lower-case) never to add or rename to, e.g. credential_names()."""
     changes: list[str] = []
     problems: list[str] = []
+    blocked = {n.lower() for n in (forbidden or set())}
     for op in ops:
         kind, name = op.get("op"), (op.get("name") or "").strip()
         if kind not in _OP_NAMES or not name:
             problems.append(f"malformed operation {op}")
+            continue
+        existing = next((p for p in act.params if p.name == name), None)
+        location = op.get("location") or (existing.location if existing else None)
+        targets = [name] + ([(op.get("new_name") or "").strip()] if kind == "rename_param" else [])
+        problem = next((pr for t in targets if t
+                        for pr in [_name_problem(t, location, blocked)] if pr), None)
+        if problem:
+            problems.append(problem)
             continue
         if act.arguments_schema is not None:
             _apply_argument_op(act, op, kind, name, changes, problems)
@@ -305,6 +346,9 @@ def _apply_param_op(act: Action, op: dict[str, Any], kind: str, name: str,
         if p is not None:
             return
         loc = op.get("location") or "query"
+        if loc not in ("query", "path", "header"):
+            problems.append(f"can't add a {loc} param")
+            return
         if loc == "path" and "{" + name + "}" not in act.path:
             problems.append(f"can't add path param '{name}': not in {act.path}")
             return
@@ -421,6 +465,11 @@ INPUT_FIX_SCHEMA = strict_object({
 })
 
 
+def _escape(text_: str) -> str:
+    """Untrusted text for the prompt: it can't close the <error> tag or open new ones."""
+    return text_.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _describe_inputs(c: Connector, act: Action) -> str:
     if act.arguments_schema is not None:
         return f"MCP tool '{act.mcp_tool}' arguments schema: {compact_schema(act.arguments_schema, c.schemas)}"
@@ -444,7 +493,7 @@ Action: {act.name} - {clip(act.summary, 120)}
 Inputs sent: {', '.join(result.get('request_params') or []) or '(none)'}
 Response: {('HTTP ' + str(result['http_status'])) if result.get('http_status') else 'tool error'}
 <error>
-{clip(result.get('error_body') or result.get('detail') or '', 1500)}
+{_escape(clip(result.get('error_body') or result.get('detail') or '', 1500))}
 </error>"""
     try:
         proposal = llm.complete_json(system=_INPUT_SYSTEM, prompt=prompt, schema=INPUT_FIX_SCHEMA,
@@ -460,7 +509,7 @@ Response: {('HTTP ' + str(result['http_status'])) if result.get('http_status') e
         fix.reason = "model found nothing to change in the definition: " + fix.reason
         return fix
     original = act.model_copy(deep=True)
-    changes, problems = apply_input_ops(act, proposal["operations"])
+    changes, problems = apply_input_ops(act, proposal["operations"], forbidden=credential_names(c))
     if problems or not changes:
         _restore(act, original)
         fix.reason = "; ".join(problems) or "operations changed nothing"
@@ -495,13 +544,17 @@ def propose_live_fixes(
     smoke_report: Any,
     *,
     llm: LLM | None = None,
-    verify_live: bool = False,
+    verify_live: bool | Callable[[LiveFixReport], bool] = False,
     credentials: Any = None,
     env: dict[str, str] | None = None,
     global_params: dict[str, Any] | None = None,
     base_url: str | None = None,
 ) -> tuple[Connector, LiveFixReport]:
-    """Return a patched copy of `connector` plus a report. Never modifies the input."""
+    """Return a patched copy of `connector` plus a report. Never modifies the input.
+
+    verify_live: re-call the API (read-only actions only) with the proposed fixes. The fixes
+    come from a model reading text the API sent, so pass a callable to approve them first:
+    it gets the report and returns True to go ahead (the CLI shows them and asks)."""
     data = json.loads(Path(smoke_report).read_text()) if isinstance(smoke_report, (str, Path)) \
         else (smoke_report.to_dict() if hasattr(smoke_report, "to_dict") else smoke_report)
     patched = connector.model_copy(deep=True)
@@ -526,6 +579,9 @@ def propose_live_fixes(
             report.fixes.append(_fix_input(patched, act, r, llm))
 
     accepted = [f for f in report.fixes if f.accepted]
+    if verify_live and accepted and callable(verify_live) and not verify_live(report):
+        report.skipped.append("live verification not approved; the fixes are unverified")
+        verify_live = False
     if verify_live and accepted:
         from ..validate.smoke import run_smoke_tests
 

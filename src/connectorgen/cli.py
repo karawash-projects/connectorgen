@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -139,6 +140,21 @@ def test(
         typer.echo(f"Wrote {emit_pytest}")
     if not report.ok:
         raise typer.Exit(1)
+
+
+def _approve_live(yes: bool) -> Any:
+    """Ask before sending requests built from model-proposed fixes (they come from text the
+    API sent, which could try to steer the model)."""
+    def approve(report: Any) -> bool:
+        typer.echo("Proposed fixes from the live API:\n" + report.to_text())
+        if yes:
+            return True
+        if not sys.stdin.isatty():
+            typer.secho("Not verifying live: no terminal to confirm on (pass --yes to verify "
+                        "without asking).", fg="yellow", err=True)
+            return False
+        return typer.confirm("Re-call the API with these fixes to verify them? (read-only actions only)")
+    return approve
 
 
 def _parse_kv(items: list[str]) -> dict:
@@ -413,7 +429,9 @@ def check(
     llm_base_url: Optional[str] = typer.Option(None, envvar="CONNECTORGEN_LLM_BASE_URL", help=_LLM_URL_HELP),
     fix_live: bool = typer.Option(False, help="Propose fixes when the live API disagrees with an "
                                               "unchanged source (needs --smoke-report)."),
-    verify_live: bool = typer.Option(False, help="Re-call the API (read-only) to confirm live fixes."),
+    verify_live: bool = typer.Option(False, help="Re-call the API (read-only) to confirm live fixes; "
+                                     "shows the fixes and asks first."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="With --verify-live: don't ask before re-calling the API."),
     param: list[str] = typer.Option([], "--param", help="name=value for --verify-live calls "
                                                         "(same as given to smoke)."),
 ) -> None:
@@ -433,7 +451,8 @@ def check(
         proposal = check_for_drift(c, spec=spec, credentials=Credentials.from_env(), llm=llm,
                                    smoke_report=smoke_report, used_actions=used,
                                    current_path=connector_path, fix_live=fix_live,
-                                   verify_live=verify_live, global_params=_parse_kv(param))
+                                   verify_live=_approve_live(yes) if verify_live else False,
+                                   global_params=_parse_kv(param))
     except ConnectorError as e:
         typer.secho(f"Error: {e}", fg="red", err=True)
         raise typer.Exit(1)

@@ -262,8 +262,14 @@ def test_cli_fix_live(connector_file, tmp_path, monkeypatch):
     smoke_json = tmp_path / "smoke.json"
     runner.invoke(app, ["smoke", str(path), "-a", "get_pet", "--param", "petId=7",
                         "--json", str(smoke_json), "--delay", "0"])
+    calls_before = respx.calls.call_count
     r = runner.invoke(app, ["check", str(path), "--smoke-report", str(smoke_json), "--fix-live",
                             "--verify-live", "--param", "petId=7", "-o", str(tmp_path / "repair")])
+    assert r.exit_code == 20, r.output                  # no terminal to confirm on: not verified
+    assert "(output, offline)" in r.output and "Not verifying live" in r.output
+    assert respx.calls.call_count == calls_before       # nothing was sent before approval
+    r = runner.invoke(app, ["check", str(path), "--smoke-report", str(smoke_json), "--fix-live",
+                            "--verify-live", "--yes", "--param", "petId=7", "-o", str(tmp_path / "repair")])
     assert r.exit_code == 20, r.output                  # live fixes always go to review
     assert "Fixes from the live API" in r.output and "(output, live)" in r.output
 
