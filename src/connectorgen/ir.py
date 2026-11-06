@@ -195,16 +195,16 @@ class Action(BaseModel):
         """One JSON Schema covering every input: params by name, plus `body`
         (or, for MCP tools, the tool's own argument schema)."""
         if self.arguments_schema is not None:
-            schema = dict(self.arguments_schema)
-            schema.setdefault("type", "object")
-            return schema
+            arguments = dict(self.arguments_schema)
+            arguments.setdefault("type", "object")
+            return arguments
         properties: dict[str, Any] = {}
         required: list[str] = []
         for p in self.params:
-            schema = dict(p.json_schema)
-            if p.description and "description" not in schema:
-                schema["description"] = p.description
-            properties[p.name] = schema
+            prop = dict(p.json_schema)
+            if p.description and "description" not in prop:
+                prop["description"] = p.description
+            properties[p.name] = prop
             if p.required:
                 required.append(p.name)
         if self.body_schema is not None:
@@ -340,7 +340,7 @@ class Connector(BaseModel):
         try:
             connector = cls.model_validate_json(raw)
         except ValidationError as e:
-            first = e.errors()[0] if e.errors() else {}
+            first: dict[str, Any] = dict(e.errors()[0]) if e.errors() else {}
             where = ".".join(map(str, first.get("loc", ()))) or "file"
             raise InvalidConnectorError(f"{path} isn't a valid connector ({where}: "
                                         f"{first.get('msg', e)}).") from None

@@ -104,7 +104,7 @@ def derive_polling_triggers(connector: Connector) -> list[Trigger]:
             source_action=act.name,
             dedup_key=dedup,
             inputs=inputs,
-            order=order,
+            order=order,  # type: ignore[arg-type]  # one of the Trigger.order values
             provenance={"trigger": "derived"},
         ))
     return triggers

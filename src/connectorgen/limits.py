@@ -86,8 +86,8 @@ def _regex_expansion(pattern: str) -> int:
     """Roughly how many nodes compiling `pattern` unrolls to: counted repeats multiply
     ((a{1000}){1000}){1000} is a billion), so it's measured on the cheap stdlib parse first."""
     try:
-        from re import _constants as C
-        from re import _parser as P
+        from re import _constants as C  # type: ignore[attr-defined]
+        from re import _parser as P  # type: ignore[attr-defined]
     except ImportError:  # pragma: no cover - Python 3.10
         import sre_constants as C  # type: ignore[no-redef]
         import sre_parse as P  # type: ignore[no-redef]

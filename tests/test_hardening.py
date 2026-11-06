@@ -2,22 +2,43 @@
 
 import copy
 import json
+import logging
 import os
 import stat
 import sys
+import time
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
 import respx
 
 import connectorgen.mcp.ingest as mcp_ingest
-from connectorgen import Connector, ConnectorError, connector_from_openapi
+from connectorgen import Connector, ConnectorClient, ConnectorError, UnsupportedSpecError, connector_from_openapi
 from connectorgen.errors import InvalidConnectorError, UnknownActionError
-from connectorgen.ir import Action, McpServerConfig, hash_spec
+from connectorgen.ingest.docs import _build_action, _grounded, _merge
+from connectorgen.ingest.openapi import fetch_spec_text, parse_spec_text
+from connectorgen.ir import (
+    Action,
+    AuthScheme,
+    McpServerConfig,
+    OAuthFlow,
+    Pagination,
+    Param,
+    Trigger,
+    WebhookSignature,
+    hash_spec,
+)
+from connectorgen.limits import BoundedValidator, SchemaTooLarge
 from connectorgen.llm import FakeLLM
 from connectorgen.repair import apply_proposal, check_for_drift
 from connectorgen.repair.diff import diff_connectors
 from connectorgen.repair.live import apply_input_ops
+from connectorgen.runtime.auth import Credentials
+from connectorgen.runtime.oauth import FileTokenStore, OAuth2Session, OAuthError, TokenSet
+from connectorgen.runtime.urls import insecure_http
+from connectorgen.triggers.webhooks import WebhookError, parse_webhook
+from connectorgen.validate.synth import Synthesizer, regex_example
 
 BASE = "https://api.acme.test/v1"
 
@@ -325,12 +346,6 @@ def test_l3_save_is_atomic_and_keeps_permissions(tmp_path):
 
 # -- step 2: untrusted input ---------------------------------------------------------------------
 
-from connectorgen import UnsupportedSpecError  # noqa: E402
-from connectorgen.ingest.openapi import fetch_spec_text, parse_spec_text  # noqa: E402
-from connectorgen.ir import Trigger, WebhookSignature  # noqa: E402
-from connectorgen.limits import BoundedValidator, SchemaTooLarge  # noqa: E402
-from connectorgen.triggers.webhooks import WebhookError, parse_webhook  # noqa: E402
-from connectorgen.validate.synth import Synthesizer, regex_example  # noqa: E402
 
 
 def test_h2_unsigned_webhooks_fail_closed():
@@ -429,12 +444,7 @@ def test_huge_compiled_regex_is_refused_not_built():
 
 
 # -- step 3: requests match the spec ------------------------------------------------------------
-from urllib.parse import parse_qsl, urlsplit  # noqa: E402
 
-from connectorgen import ConnectorClient  # noqa: E402
-from connectorgen.ingest.docs import _build_action, _grounded, _merge  # noqa: E402
-from connectorgen.ir import AuthScheme, Pagination, Param  # noqa: E402
-from connectorgen.runtime.auth import Credentials  # noqa: E402
 
 
 def _query(request):
@@ -676,12 +686,7 @@ def test_placeholder_only_paths_need_the_path_in_the_docs():  # L11
 
 
 # -- step 4: credentials -------------------------------------------------------------------------
-import logging  # noqa: E402
-import time  # noqa: E402
 
-from connectorgen.ir import OAuthFlow  # noqa: E402
-from connectorgen.runtime.oauth import FileTokenStore, OAuth2Session, OAuthError, TokenSet  # noqa: E402
-from connectorgen.runtime.urls import insecure_http  # noqa: E402
 
 
 @pytest.mark.parametrize("url,expected", [

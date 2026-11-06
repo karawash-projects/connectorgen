@@ -31,6 +31,7 @@ import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
+from .._version import __version__
 from ..enrich.context import UNTRUSTED_NOTICE
 from ..enrich.passes import (
     AUTH_SCHEME_SCHEMA,
@@ -137,7 +138,7 @@ def fetch_docs(sources: list[str], *, crawl: bool = False, max_pages: int = 15,
     takes longer than page_seconds is skipped, and fetching stops after total_seconds.
     An OpenAPI spec among the URLs you passed is refused (use `generate`); one reached by
     crawling is skipped."""
-    client = http or httpx.Client(timeout=30, headers={"User-Agent": "connectorgen-docs/0.9"})
+    client = http or httpx.Client(timeout=30, headers={"User-Agent": f"connectorgen-docs/{__version__}"})
     pages: list[DocPage] = []
     allowed = {origin(s) for s in sources if s.startswith(("http://", "https://"))}
     try:
@@ -673,9 +674,9 @@ def connector_from_docs(
     seen_auth: set[tuple[str, str | None]] = set()
     unique_auth = []
     for item in auth_items:
-        key = (item["type"], item.get("param_name") or None)
-        if key not in seen_auth:
-            seen_auth.add(key)
+        auth_key = (str(item["type"]), item.get("param_name") or None)
+        if auth_key not in seen_auth:
+            seen_auth.add(auth_key)
             unique_auth.append(item)
     auth, problems = auth_from_proposal(unique_auth, prefix="docs")
     connector_notes += problems

@@ -116,7 +116,7 @@ def merge_shapes(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
 
 def enum_findings(schema: dict[str, Any], data: Any) -> list[dict[str, Any]]:
     """Short code values the response used outside the spec's enums: [{path, value}]."""
-    found = []
+    found: list[dict[str, Any]] = []
     try:
         errors = BoundedValidator(schema).errors(data)
     except SchemaTooLarge:

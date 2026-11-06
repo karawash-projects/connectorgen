@@ -10,6 +10,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 ruff check src tests scripts
+mypy
 ```
 
 Python 3.10–3.13 are supported, and CI runs them all on Linux, plus 3.13 on macOS.
@@ -32,7 +33,7 @@ python scripts/corpus_check.py path/to/specs --jobs 8   # robustness over many r
 ## Before you open a pull request
 
 - Add a test for the behavior you changed. For a bug, add a test that fails without your fix.
-- Run `pytest` and `ruff check src tests scripts`.
+- Run `pytest`, `ruff check src tests scripts` and `mypy`.
 - If you changed spec handling, run the corpus check against real specs (below) and mention
   the before/after numbers in the PR.
 - Update `CHANGELOG.md` under "Unreleased".
@@ -121,8 +122,9 @@ Releases are published to PyPI by `.github/workflows/release.yml` when a `v*` ta
 using PyPI trusted publishing (no API token is stored in GitHub). One-time setup: on
 <https://pypi.org/manage/account/publishing/>, add a publisher for this repository with
 workflow `release.yml` and environment `pypi`. Then, for each release: update the version in
-`pyproject.toml` and `src/connectorgen/__init__.py`, move the "Unreleased" changelog entries
-under the new version, and push a tag such as `v0.9.1`.
+`src/connectorgen/_version.py` (the only place it's written), move the "Unreleased" changelog
+entries under the new version, and push a tag such as `v0.9.2`. The workflow runs the full CI
+first and refuses a tag that doesn't match the version.
 
 ## Code of conduct
 

@@ -356,7 +356,8 @@ def _apply_param_op(act: Action, op: dict[str, Any], kind: str, name: str,
         if loc == "path" and "{" + name + "}" not in act.path:
             problems.append(f"can't add path param '{name}': not in {act.path}")
             return
-        act.params.append(Param(name=name, location=loc, required=bool(op.get("required")) or loc == "path",
+        act.params.append(Param(name=name, location=loc,  # type: ignore[arg-type]  # checked above
+                                required=bool(op.get("required")) or loc == "path",
                                 json_schema=_param_schema(op), description=op.get("description", "")))
         changes.append(f"add {loc} param '{name}'" + (" (required)" if op.get("required") else ""))
         return

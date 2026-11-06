@@ -602,7 +602,7 @@ def _oauth_flows(flows: dict[str, Any]) -> list[OAuthFlow]:
         f = flows.get(key)
         if isinstance(f, dict) and f.get("tokenUrl"):
             out.append(OAuthFlow(
-                flow=kind,
+                flow=kind,  # type: ignore[arg-type]
                 authorization_url=f.get("authorizationUrl"),
                 token_url=f["tokenUrl"],
                 refresh_url=f.get("refreshUrl"),
@@ -798,10 +798,10 @@ def _split_query_template(path: str, params: list[Param],
         key, _, value = pair.partition("=")
         m = re.fullmatch(r"\{([^}]+)\}", value)
         if m and m.group(1) not in by_name:  # undeclared {x}: a required string query param
-            target = Param(name=m.group(1), location="query", required=True,
-                           json_schema={"type": "string"})
-            params.append(target)
-            by_name[target.name] = target
+            added = Param(name=m.group(1), location="query", required=True,
+                          json_schema={"type": "string"})
+            params.append(added)
+            by_name[added.name] = added
             notes.append(f"Query placeholder '{{{m.group(1)}}}' wasn't declared; added as a "
                          "required string.")
         target = by_name.get(m.group(1)) if m else None
@@ -868,7 +868,7 @@ def _connector_from_openapi(
     detector = _Detector(resolver)
     scheme_ids = set(((spec.get("components") or {}).get("securitySchemes") or {}).keys())
     global_security = spec.get("security")
-    info = spec.get("info") if isinstance(spec.get("info"), dict) else {}
+    info: dict[str, Any] = spec["info"] if isinstance(spec.get("info"), dict) else {}
     title = _text(info.get("title")) or "api"
 
     actions: list[Action] = []
@@ -976,12 +976,12 @@ def _connector_from_openapi(
                 operation_id=None if op.get("operationId") is None else str(op["operationId"]),
                 summary=_text(op.get("summary")),
                 description=_text(op.get("description")),
-                method=upper,
+                method=upper,  # type: ignore[arg-type]  # from HTTP_METHODS
                 path=op_path,
                 params=params,
                 body_schema=body_schema,
                 body_required=body_required,
-                body_encoding=body_encoding,
+                body_encoding=body_encoding,  # type: ignore[arg-type]
                 output_schema=output_schema,
                 pagination=detector.pagination(upper, params, output_schema, notes),
                 destructive=upper == "DELETE" or bool(DESTRUCTIVE_WORDS.search(action_name)),

@@ -116,16 +116,17 @@ map them to step failures, retries, or user-facing messages.
 | Area | Supported |
 |---|---|
 | Sources | OpenAPI 3.0 / 3.1, Swagger 2.0 (converted automatically), API docs pages (with an LLM), MCP servers (stdio or Streamable HTTP) |
-| Specs | JSON or YAML (1.2), URL or file; local `$ref`s (recursive, percent-encoded, into lists); tolerant of common spec mistakes (dates in YAML, boolean `exclusiveMinimum`, JS-style regex, relative server URLs, duplicate params, query strings in paths) |
-| Auth | API key (header / query / cookie), bearer, basic, OAuth2 (authorization code + PKCE, client credentials, refresh); per-operation `security`, so each action uses the credentials it accepts |
-| Inputs and bodies | path, query and header params; JSON bodies; form-encoded bodies with nested objects in bracket notation (`metadata[plan]=pro`) |
+| Specs | JSON or YAML (1.2), URL or file; local `$ref`s (recursive, percent-encoded, into lists); tolerant of common spec mistakes (dates in YAML, boolean `exclusiveMinimum`, JS-style regex, relative server URLs, duplicate params, query strings in paths); spec URLs aren't redirected to plain http or to private addresses |
+| Auth | API key (header / query / cookie), bearer, basic, OAuth2 (authorization code + PKCE, client credentials, refresh; other flows with a token you supply); per-operation `security`, including schemes that must be sent together, so each action uses the credentials it accepts |
+| Inputs and bodies | path, query and header params, with OpenAPI serialization styles (`deepObject`, `form`, `spaceDelimited`, `pipeDelimited`, `label`, `matrix`); JSON bodies; form-encoded bodies with nested objects in bracket notation (`metadata[plan]=pro`). Multipart (file upload) bodies aren't sent yet |
 | Pagination | cursor (incl. nested cursor fields), cursor-as-URL, Stripe-style `starting_after` + `has_more`, offset, page, RFC 8288 `Link` headers (GitHub style) |
 | Triggers | polling ("new X") from list actions, with dedup and resume; webhooks from the spec, with HMAC signature checks (GitHub and Stripe presets) |
 | Reliability | retries for rate limits, transient 5xx and network failures; optional response validation |
 | Testing | offline contract tests for every action; live, read-only smoke tests |
 | Keeping current | `check` / `diff` / `apply`: changes classified as breaking, review, additive or info; local customizations kept; fixes from live API evidence |
-| Credentials | sent only to the API's own origin (next-page links and redirects can't carry them elsewhere); never in connector files, `repr()`, error messages or request logs |
-| Safety | destructive actions flagged and opt-in (`--allow-destructive`); smoke tests read-only; updates need approval unless purely additive |
+| Credentials | sent only to the API's own origin (next-page links and redirects can't carry them elsewhere), and never over plain http to another machine; never in connector files, `repr()`, error messages or request logs |
+| Safety | destructive actions (every PUT, PATCH and DELETE, and POSTs that delete, revoke, refund, …) flagged and opt-in (`--allow-destructive`); smoke tests read-only; updates need approval unless purely additive; webhooks without a configured secret are refused unless allowed |
+| Limits | response size, total request time, pages, spec size and nesting, regex and schema-validation work are all bounded, for specs, docs and servers you don't control |
 
 On the full Stripe (612 actions) and GitHub (1,242 actions) specs, every action passes its
 contract test, and pagination is detected for 133 and 274 actions respectively.

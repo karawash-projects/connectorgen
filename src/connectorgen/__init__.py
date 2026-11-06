@@ -1,5 +1,6 @@
 """connectorgen: connectors for HTTP APIs and MCP servers, as data, with one runtime."""
 
+from ._version import __version__
 from .errors import (
     ActionHTTPError,
     ConnectionFailedError,
@@ -18,6 +19,7 @@ from .runtime.client import ConnectorClient
 from .runtime.retry import RetryPolicy
 
 __all__ = [
+    "__version__",
     "Action",
     "ActionHTTPError",
     "AuthScheme",
@@ -40,4 +42,3 @@ __all__ = [
     "load_spec",
 ]
 
-__version__ = "0.9.0"

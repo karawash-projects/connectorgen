@@ -179,7 +179,7 @@ class _Converter:
         if body is not None:
             schema = self.schema(body.get("schema") or {})
             types = [c for c in consumes if _is_json(c)] or consumes or ["application/json"]
-            out = {"content": {ct: {"schema": schema} for ct in types}}
+            out: dict[str, Any] = {"content": {ct: {"schema": schema} for ct in types}}
             if body.get("description"):
                 out["description"] = body["description"]
             if body.get("required"):
@@ -192,15 +192,15 @@ class _Converter:
                                     **({"description": p["description"]} if p.get("description") else {})}
                 if p.get("required"):
                     required.append(p["name"])
-            schema: dict[str, Any] = {"type": "object", "properties": props}
+            form_schema: dict[str, Any] = {"type": "object", "properties": props}
             if required:
-                schema["required"] = required
+                form_schema["required"] = required
             has_file = any(p.get("type") == "file" for p in form)
             multipart = has_file or any(c.startswith("multipart/") for c in consumes)
             urlencoded = any(c.startswith("application/x-www-form-urlencoded") for c in consumes)
             media = "multipart/form-data" if multipart and (has_file or not urlencoded) \
                 else "application/x-www-form-urlencoded"
-            out = {"content": {media: {"schema": schema}}}
+            out = {"content": {media: {"schema": form_schema}}}
             if required:
                 out["required"] = True
             return out

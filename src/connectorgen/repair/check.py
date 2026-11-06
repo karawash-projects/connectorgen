@@ -188,8 +188,8 @@ def _regenerate(current: Connector, kind: str, *, spec: Any, credentials: Creden
     from ..ingest.docs import connector_from_docs, fetch_docs
 
     if spec is not None:  # explicit sources from the caller (may include local files)
-        sources = [spec] if isinstance(spec, (str, Path)) else list(spec)
-        sources = [part.strip() for x in sources for part in str(x).split(",") if part.strip()]
+        given = [spec] if isinstance(spec, (str, Path)) else list(spec)
+        sources = [part.strip() for x in given for part in str(x).split(",") if part.strip()]
     else:
         # Sources recorded in the connector file are only trusted as URLs: a shared file
         # could otherwise name a local file (a private key, say) to be read and sent to the model.

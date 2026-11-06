@@ -111,9 +111,9 @@ class Synthesizer:
                 return self._value(merged, depth, name, branch_seen)
 
         if isinstance(schema.get("allOf"), list):
-            merged: dict[str, Any] = {k: v for k, v in schema.items() if k != "allOf"}
-            props: dict[str, Any] = dict(merged.get("properties") or {})
-            required: list[str] = list(merged.get("required") or [])
+            combined: dict[str, Any] = {k: v for k, v in schema.items() if k != "allOf"}
+            props: dict[str, Any] = dict(combined.get("properties") or {})
+            required: list[str] = list(combined.get("required") or [])
             for sub in schema["allOf"]:
                 sub, _ = self._deref(sub, seen)
                 if isinstance(sub, dict):  # (skips _CYCLE)
@@ -121,10 +121,10 @@ class Synthesizer:
                     required += sub.get("required") or []
                     for k, v in sub.items():
                         if k not in ("properties", "required"):
-                            merged.setdefault(k, v)
-            merged["properties"], merged["required"] = props, required
-            merged.setdefault("type", "object")
-            return self._value(merged, depth, name, seen)
+                            combined.setdefault(k, v)
+            combined["properties"], combined["required"] = props, required
+            combined.setdefault("type", "object")
+            return self._value(combined, depth, name, seen)
 
         stype = schema.get("type")
         if isinstance(stype, list):
@@ -269,7 +269,7 @@ class Synthesizer:
         return value
 
 
-_PY_TYPES = {"string": str, "integer": int, "number": (int, float), "boolean": bool,
+_PY_TYPES: dict[str, type | tuple[type, ...]] = {"string": str, "integer": int, "number": (int, float), "boolean": bool,
              "array": list, "object": dict}
 
 
@@ -310,8 +310,8 @@ def _search(pattern: str, value: str) -> bool:
 
 
 try:  # Python 3.11+
-    from re import _constants as _C
-    from re import _parser as _sre_parse
+    from re import _constants as _C  # type: ignore[attr-defined]
+    from re import _parser as _sre_parse  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover
     import sre_constants as _C  # type: ignore[no-redef]
     import sre_parse as _sre_parse  # type: ignore[no-redef]

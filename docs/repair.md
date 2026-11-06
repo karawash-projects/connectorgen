@@ -62,7 +62,7 @@ proposes fixes from that evidence:
 ```bash
 connectorgen smoke github.json --param owner=octocat --json smoke.json
 connectorgen check github.json --smoke-report smoke.json --fix-live --verify-live \
-    --param owner=octocat --model openai:gpt-6-luna
+    --param owner=octocat --model openai:gpt-6-luna    # asks before calling the API; --yes to skip
 connectorgen apply repair/ github.json
 ```
 
@@ -81,6 +81,13 @@ Guardrails:
   envelope sent with 200), no automatic fix is made; a person needs to look.
 - **Shared schemas stay untouched.** Only the affected action's schema changes, so other
   actions sharing that definition aren't loosened.
+- **Live verification asks first.** `--verify-live` sends the fixed requests to the real API, so
+  `check` lists them and asks before sending; pass `--yes` in scripts. Without a terminal and
+  without `--yes`, fixes stay unverified. In code, `verify_live` can be a function that
+  approves or declines the list.
+- **Fixes can't add credential or hop-by-hop headers.** A proposed parameter named like an
+  auth header (`Authorization`, `Cookie`, the connector's own API-key header) or `Host`,
+  `Content-Length` and similar is refused.
 - **Always reviewed.** Live fixes get the verdict `live_fix` (exit 20) and are never
   auto-applied. Model proposals that are low-confidence, malformed, or fail contract tests
   are dropped.

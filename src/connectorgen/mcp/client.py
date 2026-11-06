@@ -22,6 +22,7 @@ from contextlib import AsyncExitStack
 from typing import Any, Literal
 
 
+from .._version import __version__
 from ..errors import (
     ConnectorError,
     InputValidationError,
@@ -51,7 +52,7 @@ def _mcp_http_client(headers: dict[str, str]) -> Any:
     try:
         import httpx2 as hx  # type: ignore[import-not-found]
     except ImportError:
-        import httpx as hx
+        import httpx as hx  # type: ignore[no-redef]
     return hx.AsyncClient(headers=headers, timeout=hx.Timeout(30.0, read=300.0))
 
 
@@ -180,7 +181,7 @@ class AsyncMcpClient:
                                        allow_insecure=self.allow_insecure)
             if http is not None:
                 await stack.enter_async_context(http)
-            info = mcp.types.Implementation(name=CLIENT_NAME, version="0.9")
+            info = mcp.types.Implementation(name=CLIENT_NAME, version=__version__)
             self._client = await stack.enter_async_context(
                 mcp.Client(target, client_info=info, read_timeout_seconds=self.timeout))
         except BaseException as e:

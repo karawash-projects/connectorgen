@@ -62,7 +62,7 @@ def redact_url(url: str | httpx.URL, extra: set[str] | None = None) -> str:
         u = u.copy_with(username=None, password=None)
     if not u.query:
         return str(u)
-    pairs = []
+    pairs: list[tuple[str, str | int | float | bool | None]] = []
     for key, value in u.params.multi_items():
         hidden = key.lower() in names or is_secret_name(key)
         pairs.append((key, "***" if hidden and value else value))
@@ -160,12 +160,13 @@ def private_address(url: str) -> bool:
         addresses = []
         for info in infos:
             try:
-                addresses.append(ipaddress.ip_address(info[4][0].split("%")[0]))
+                addresses.append(ipaddress.ip_address(str(info[4][0]).split("%")[0]))
             except ValueError:
                 continue
     for ip in addresses:
-        if getattr(ip, "ipv4_mapped", None):
-            ip = ip.ipv4_mapped
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            ip = mapped
         if not ip.is_global or ip.is_multicast:
             return True
     return False

@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, quote
 
 import httpx
 
+from .._version import __version__
 from ..errors import (
     ActionHTTPError,
     ConnectionFailedError,
@@ -34,7 +35,7 @@ from .urls import (
     same_origin,
 )
 
-USER_AGENT = "connectorgen/0.9"
+USER_AGENT = f"connectorgen/{__version__}"
 MAX_REDIRECTS = 10
 # Headers kept when a redirect leaves the API's origin; everything else (Authorization,
 # Cookie, X-API-Key and any other header that could carry a secret) is dropped.
@@ -173,6 +174,7 @@ class ConnectorClient:
 
         request = self.build_request(act, params)
         stats["params"] = dict(params)
+        request_param = p.request_param or ""  # set whenever the pagination isn't broken
         pages = 0
         seen_cursors: set[str] = set()
         seen_pages: set[str] = set()
@@ -248,15 +250,15 @@ class ConnectorClient:
                     request = self._follow_url(request, nxt, self.schemes_for(act))  # "next" is a full URL
                     stats["params"] = None
                     continue
-                params[p.request_param] = nxt  # type: ignore[index]
+                params[request_param] = nxt
             else:
                 if isinstance(limit, int) and len(items) < limit:
                     stats["exhausted"] = True
                     return  # short page = last page
                 if p.style == "offset":
-                    params[p.request_param] = int(params.get(p.request_param) or 0) + len(items)  # type: ignore[index]
+                    params[request_param] = int(params.get(request_param) or 0) + len(items)
                 else:  # page
-                    params[p.request_param] = int(params.get(p.request_param) or 1) + 1  # type: ignore[index]
+                    params[request_param] = int(params.get(request_param) or 1) + 1
             request = self.build_request(act, params)
             stats["params"] = dict(params)
 
@@ -450,14 +452,14 @@ class ConnectorClient:
                 continue
 
             if response.is_error and can_retry and policy.should_retry_response(request, response):
-                wait = policy.server_wait(response)
-                if wait is None:
-                    wait = policy.backoff(attempt)
-                if wait <= policy.max_wait:
+                delay = policy.server_wait(response)
+                if delay is None:
+                    delay = policy.backoff(attempt)
+                if delay <= policy.max_wait:
                     log.warning("%s: HTTP %d; retrying in %.1fs (attempt %d/%d)", action.name,
-                                response.status_code, wait, attempt + 1, policy.max_attempts)
+                                response.status_code, delay, attempt + 1, policy.max_attempts)
                     response.close()
-                    policy.sleep(wait)
+                    policy.sleep(delay)
                     continue
             break
 
