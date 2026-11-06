@@ -25,7 +25,7 @@ import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
-from ..runtime.urls import same_origin
+from ..runtime.urls import insecure_http, same_origin
 from .base import LLMError, Usage
 
 # provider: (base URL, API key env var, wire protocol)
@@ -96,6 +96,7 @@ class OpenAICompatibleLLM:
         max_retries: int = 2,
         extra_headers: dict[str, str] | None = None,
         http: httpx.Client | None = None,
+        allow_insecure: bool = False,
     ):
         preset = PRESETS.get(provider or "")
         if provider and preset is None:
@@ -107,13 +108,16 @@ class OpenAICompatibleLLM:
         if not self.base_url:
             raise LLMError("An OpenAI-compatible model needs base_url (e.g. http://localhost:8000/v1).")
         # A provider's own key (OPENAI_API_KEY, ...) only ever goes to that provider's own
-        # host. With a custom base URL, pass api_key= or set CONNECTORGEN_LLM_API_KEY.
+        # host, and CONNECTORGEN_LLM_API_KEY only to a custom base URL.
         own_host = bool(preset_url) and same_origin(self.base_url, preset_url)
-        key_env = preset[1] if preset and own_host else None
-        self.api_key = api_key or os.environ.get("CONNECTORGEN_LLM_API_KEY") or \
-            (os.environ.get(key_env) if key_env else None)
+        key_env = (preset[1] if own_host else None) if preset else None
+        env_name = key_env if own_host else "CONNECTORGEN_LLM_API_KEY"
+        self.api_key = api_key or (os.environ.get(env_name) if env_name else None)
         if key_env and not self.api_key:
-            raise LLMError(f"No API key for {self.provider}: set {key_env} (or CONNECTORGEN_LLM_API_KEY).")
+            raise LLMError(f"No API key for {self.provider}: set {key_env}.")
+        if self.api_key and insecure_http(self.base_url) and not allow_insecure:
+            raise LLMError(f"Refusing to send an API key over plain http to {self.base_url}; "
+                           "use https or pass allow_insecure=True.")
         self.api = api or (preset[2] if preset else "chat")
         self.model = model
         self.cache_identity = f"openai-compatible:{self.provider}:{self.base_url}:{self.api}:{model}"
@@ -121,12 +125,12 @@ class OpenAICompatibleLLM:
         self._mode: Mode = "schema" if json_mode == "auto" else json_mode  # type: ignore[assignment]
         self._auto = json_mode == "auto"
         self.max_retries = max_retries
-        headers = {"Content-Type": "application/json", **(extra_headers or {})}
+        # Sent with each request rather than set on the client: a client passed in may be
+        # shared, and must not carry this key to other hosts.
+        self._headers = {"Content-Type": "application/json", **(extra_headers or {})}
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        self.http = http or httpx.Client(timeout=timeout, headers=headers)
-        if http is not None:
-            self.http.headers.update(headers)
+            self._headers["Authorization"] = f"Bearer {self.api_key}"
+        self.http = http or httpx.Client(timeout=timeout)
 
     @property
     def json_mode(self) -> Mode:
@@ -175,7 +179,7 @@ class OpenAICompatibleLLM:
     def _post(self, path: str, body: dict[str, Any]) -> httpx.Response:
         for attempt in range(self.max_retries + 1):
             try:
-                resp = self.http.post(self.base_url + path, json=body)
+                resp = self.http.post(self.base_url + path, json=body, headers=self._headers)
             except httpx.TransportError as e:
                 if attempt == self.max_retries:
                     raise LLMError(f"Can't reach {self.base_url}: {type(e).__name__}: {e}") from e

@@ -302,8 +302,15 @@ def describe_error(error: Any) -> str:
     if v == "enum":
         return f"value outside the allowed set ({len(expected)} values)"
     if v == "additionalProperties" and isinstance(error.instance, dict):
+        from ..repair.observe import data_like_key
+
         allowed = set(error.schema.get("properties") or {})
-        return f"unexpected field(s) {sorted(k for k in error.instance if k not in allowed)[:5]}"
+        extra = [str(k) for k in error.instance if k not in allowed]
+        named = sorted(k for k in extra if not data_like_key(k))[:5]
+        more = len(extra) - len(named)  # data-like keys (emails, ids) aren't repeated
+        if not named:
+            return f"{more} unexpected field(s)"
+        return f"unexpected field(s) {named}" + (f" and {more} more" if more else "")
     if v in ("anyOf", "oneOf"):
         return f"matched none of the {len(expected)} allowed shapes (got {_type(error.instance)})"
     return f"failed the '{v}' constraint"

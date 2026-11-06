@@ -13,6 +13,7 @@ with owner-only permissions; tokens are never logged.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -22,7 +23,7 @@ import tempfile
 import threading
 import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -33,6 +34,7 @@ import httpx
 
 from ..errors import ConnectorError
 from ..ir import OAuthFlow
+from .urls import insecure_http
 
 
 class OAuthError(ConnectorError):
@@ -88,8 +90,30 @@ class MemoryTokenStore:
 
 
 class FileTokenStore:
+    """Tokens in a JSON file. Several processes may share one: refreshes take a lock on
+    `<file>.lock`, and each re-reads the file first, so a refresh token rotated by one
+    process isn't reused (and rejected) by another."""
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
+
+    @contextlib.contextmanager
+    def lock(self) -> Iterator[None]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(f"{self.path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                import fcntl
+            except ImportError:  # pragma: no cover - Windows: no cross-process lock
+                yield
+                return
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def load(self) -> TokenSet | None:
         if not self.path.exists():
@@ -131,8 +155,10 @@ class OAuth2Session:
         client_auth: Literal["body", "basic"] = "body",
         http: httpx.Client | None = None,
         clock: Callable[[], float] = time.time,
+        allow_insecure: bool = False,
     ):
         self.flow = flow
+        self.allow_insecure = allow_insecure
         self.client_id = client_id
         self.client_secret = client_secret
         self.store = store or MemoryTokenStore()
@@ -208,11 +234,29 @@ class OAuth2Session:
                     raise OAuthError("Not signed in yet: run the authorization flow first "
                                      "(connectorgen auth).")
             elif force_refresh or self._token.expired(now=self.clock()):
-                self.refresh()
+                self._refresh_shared()
             assert self._token is not None
             return self._token.access_token
 
+    def _refresh_shared(self) -> None:
+        """Refresh, unless another process sharing the store already has: re-read the store
+        under its lock and use a newer token if there is one."""
+        lock = getattr(self.store, "lock", None)
+        with lock() if callable(lock) else contextlib.nullcontext():
+            stale = self._token
+            latest = self.store.load()
+            if latest is not None and stale is not None \
+                    and latest.access_token != stale.access_token:
+                self._token = latest  # with any rotated refresh token
+                if not latest.expired(now=self.clock()):
+                    return
+            self.refresh()
+
     def _token_request(self, data: dict[str, str], url: str | None = None) -> TokenSet:
+        target = url or self.flow.token_url
+        if insecure_http(target) and not self.allow_insecure:
+            raise OAuthError(f"Refusing to send client credentials over plain http to {target}; "
+                             "use https or pass allow_insecure=True.")
         headers = {"Accept": "application/json"}
         payload = dict(data)
         if self.client_auth == "basic" and self.client_secret is not None:
@@ -223,7 +267,7 @@ class OAuth2Session:
             if self.client_secret is not None:
                 payload["client_secret"] = self.client_secret
         try:
-            resp = self.http.post(url or self.flow.token_url, data=payload, headers=headers)
+            resp = self.http.post(target, data=payload, headers=headers)
         except httpx.HTTPError as e:
             raise OAuthError(f"Token endpoint unreachable: {type(e).__name__}") from e
         try:

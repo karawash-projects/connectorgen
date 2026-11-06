@@ -76,29 +76,63 @@ def redact_text(text: str) -> str:
     return _URL_IN_TEXT.sub(lambda m: redact_url(m.group(0)), text)
 
 
+def _redact_arg(a: Any) -> Any:
+    if isinstance(a, httpx.URL):
+        return redact_url(a)
+    if isinstance(a, str):
+        return redact_text(a)
+    if type(a).__name__ == "URL":  # another HTTP library's URL type (e.g. httpx2's)
+        return redact_text(str(a))
+    return a
+
+
 class _RedactFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.args:
-            record.args = tuple(redact_url(a) if isinstance(a, httpx.URL) else
-                                redact_text(a) if isinstance(a, str) else a
-                                for a in (record.args if isinstance(record.args, tuple)
-                                          else (record.args,)))
+        if isinstance(record.args, dict):
+            record.args = {k: _redact_arg(v) for k, v in record.args.items()}
+        elif record.args:
+            record.args = tuple(_redact_arg(a) for a in (
+                record.args if isinstance(record.args, tuple) else (record.args,)))
         if isinstance(record.msg, str) and "://" in record.msg:
             record.msg = redact_text(record.msg)
         return True
 
 
 _installed = False
+# httpx and httpcore, the httpx2/httpcore2 the MCP SDK may use, and the MCP transports,
+# which log the endpoint URL (with any ?api_key=) when connecting.
+_HTTP_LOGGERS = ("httpx", "httpcore", "httpx2", "httpcore2", "mcp.client.streamable_http",
+                 "mcp.client.sse")
 
 
 def install_log_redaction() -> None:
-    """Redact query secrets in httpx's own request logs (idempotent)."""
+    """Redact query secrets in the HTTP libraries' own request logs (idempotent)."""
     global _installed
     if _installed:
         return
-    for name in ("httpx", "httpcore"):
+    for name in _HTTP_LOGGERS:
         logging.getLogger(name).addFilter(_RedactFilter())
     _installed = True
+
+
+def insecure_http(url: str | httpx.URL) -> bool:
+    """Plain http to anything but this machine: credentials would cross the network
+    unencrypted."""
+    try:
+        u = httpx.URL(str(url))
+    except Exception:  # noqa: BLE001
+        return False
+    if u.scheme != "http":
+        return False
+    host = (u.host or "").strip("[]").lower()
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+        return False
+    import ipaddress
+
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
 
 
 def private_address(url: str) -> bool:

@@ -6,8 +6,10 @@ Docs: https://platform.claude.com/docs/en/build-with-claude/structured-outputs
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
+from ..runtime.urls import insecure_http
 from .base import LLMError, Usage
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
@@ -15,14 +17,25 @@ DEFAULT_MODEL = "claude-sonnet-5-5"
 
 class AnthropicLLM:
     def __init__(self, model: str = DEFAULT_MODEL, *, api_key: str | None = None,
-                 client: Any = None, max_retries: int = 3, timeout: float = 300.0):
+                 base_url: str | None = None, client: Any = None, max_retries: int = 3,
+                 timeout: float = 300.0, allow_insecure: bool = False):
+        """base_url: an Anthropic-compatible gateway. Its key comes from api_key or
+        CONNECTORGEN_LLM_API_KEY; ANTHROPIC_API_KEY is only sent to Anthropic's own API."""
         if client is None:
             try:
                 import anthropic
             except ImportError as e:  # pragma: no cover
                 raise LLMError("Install the AI extra: pip install 'connectorgen[ai]'") from e
-            client = anthropic.Anthropic(api_key=api_key, max_retries=max_retries,
-                                         timeout=timeout)
+            if base_url:
+                api_key = api_key or os.environ.get("CONNECTORGEN_LLM_API_KEY")
+                if not api_key:
+                    raise LLMError(f"No API key for {base_url}: pass api_key= or set "
+                                   "CONNECTORGEN_LLM_API_KEY.")
+                if insecure_http(base_url) and not allow_insecure:
+                    raise LLMError(f"Refusing to send an API key over plain http to {base_url}; "
+                                   "use https or pass allow_insecure=True.")
+            client = anthropic.Anthropic(api_key=api_key, base_url=base_url,
+                                         max_retries=max_retries, timeout=timeout)
         self.client = client
         self.model = model
         self.usage = Usage()

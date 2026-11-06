@@ -8,7 +8,8 @@
     llm_from_spec("my-model", base_url="http://localhost:8000/v1")   # any compatible server
 
 Environment: CONNECTORGEN_MODEL (default spec), CONNECTORGEN_LLM_BASE_URL,
-CONNECTORGEN_LLM_API_KEY (overrides the provider's own key variable).
+CONNECTORGEN_LLM_API_KEY (the key for a custom base URL; a provider's own key variable
+is only ever sent to that provider).
 """
 
 from __future__ import annotations
@@ -35,7 +36,8 @@ def llm_from_spec(spec: str | None = None, *, base_url: str | None = None,
     if provider == "anthropic" or (not provider and rest.startswith("claude") and not base_url):
         from .anthropic import AnthropicLLM
 
-        return AnthropicLLM(model=rest, api_key=api_key or os.environ.get("CONNECTORGEN_LLM_API_KEY"))
+        return AnthropicLLM(model=rest, api_key=api_key, base_url=base_url,
+                            **{k: v for k, v in options.items() if k == "allow_insecure"})
     if provider in PRESETS:
         return OpenAICompatibleLLM(rest, provider=provider, base_url=base_url, api_key=api_key, **options)
     if base_url:  # "custom:model" or a bare model name with a base URL

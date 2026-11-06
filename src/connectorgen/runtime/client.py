@@ -24,7 +24,13 @@ from ..ir import Action, Connector, pagination_problem
 from ..limits import BoundedValidator, SchemaTooLarge
 from .auth import Credentials, apply_auth, pick_scheme
 from .retry import RetryPolicy, log
-from .urls import install_log_redaction, redact_url, register_secret_param, same_origin
+from .urls import (
+    insecure_http,
+    install_log_redaction,
+    redact_url,
+    register_secret_param,
+    same_origin,
+)
 
 USER_AGENT = "connectorgen/0.9"
 MAX_REDIRECTS = 10
@@ -68,6 +74,7 @@ class ConnectorClient:
         validate: bool = True,
         retry: RetryPolicy | None = None,
         validate_responses: Literal["off", "warn", "raise"] = "off",
+        allow_insecure: bool = False,
     ):
         """
         retry: defaults to RetryPolicy(); pass RetryPolicy.disabled() to turn retries off.
@@ -75,7 +82,10 @@ class ConnectorClient:
             "warn" emits ResponseSchemaWarning, "raise" raises ResponseValidationError.
             Useful for spotting API drift; off by default because real-world specs
             are often looser than the APIs they describe.
+        allow_insecure: send credentials over plain http to hosts other than this
+            machine (refused by default: anyone on the network could read them).
         """
+        self.allow_insecure = allow_insecure
         self.connector = connector
         self.retry = retry if retry is not None else RetryPolicy()
         self.validate_responses = validate_responses
@@ -269,8 +279,14 @@ class ConnectorClient:
             raise ConnectorError(
                 f"'{action.name}' requires {' or '.join(ids) or 'some'} credentials, "
                 "which weren't provided.")
+        before = (dict(headers), dict(query), dict(cookies))
         for scheme in schemes:
             apply_auth(scheme, self.credentials, headers, query, cookies)
+        if (headers, query, cookies) != before and not self.allow_insecure \
+                and insecure_http(self.base_url):
+            raise ConnectorError(
+                f"Refusing to send credentials over plain http to {self.base_url}; use https "
+                "or pass allow_insecure=True.")
 
         kwargs: dict[str, Any] = {"params": query, "headers": headers}
         if cookies:

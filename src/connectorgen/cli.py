@@ -14,6 +14,7 @@ from .ingest.openapi import connector_from_openapi
 from .ir import Connector
 from .runtime.auth import Credentials
 from .runtime.client import ConnectorClient
+from .runtime.urls import insecure_http
 
 app = typer.Typer(help="Generate API connectors from OpenAPI specs and run them.",
                   no_args_is_help=True)
@@ -386,6 +387,8 @@ def serve(
     allow_destructive: bool = typer.Option(False, help="Also expose destructive actions."),
     token_file: Optional[Path] = typer.Option(None),
     base_url: Optional[str] = typer.Option(None),
+    allow_insecure: bool = typer.Option(False, help="Send credentials over plain http to a "
+                                        "host other than this machine."),
 ) -> None:
     """Serve a connector as an MCP server, so Claude and other agents can use its actions."""
     import anyio
@@ -396,7 +399,8 @@ def serve(
     try:
         server = build_mcp_server(c, _credentials(c, token_file), actions=action or None,
                                   tags=tag or None, read_only=read_only,
-                                  allow_destructive=allow_destructive, base_url=base_url)
+                                  allow_destructive=allow_destructive, base_url=base_url,
+                                  allow_insecure=allow_insecure)
     except ConnectorError as e:
         typer.secho(f"Error: {e}", fg="red", err=True)
         raise typer.Exit(1)
@@ -405,6 +409,10 @@ def serve(
             anyio.run(serve_stdio, server)
         elif transport == "http":
             typer.secho(f"Serving MCP at http://{host}:{port}/mcp", fg="green", err=True)
+            if insecure_http(f"http://{host}"):
+                typer.secho(f"Warning: {host} is reachable from other machines, and the server "
+                            "has no authentication of its own: anyone who can reach it can "
+                            "call these actions with your credentials.", fg="yellow", err=True)
             serve_http(server, host=host, port=port)
         else:
             raise typer.BadParameter("--transport must be stdio or http")
@@ -609,6 +617,8 @@ def call(
     base_url: Optional[str] = typer.Option(None),
     allow_destructive: bool = typer.Option(False, help="Required for destructive actions."),
     token_file: Optional[Path] = typer.Option(None, help="Saved OAuth token (from `auth`)."),
+    allow_insecure: bool = typer.Option(False, help="Send credentials over plain http to a "
+                                        "host other than this machine."),
 ) -> None:
     """Call an action. Credentials come from CONNECTORGEN_API_KEY / _TOKEN / _USERNAME / _PASSWORD."""
     c = Connector.load(connector_path)
@@ -639,10 +649,11 @@ def call(
 
             if paginate:
                 raise typer.BadParameter("--paginate doesn't apply to MCP tools.")
-            with McpClient(c, creds) as client:
+            with McpClient(c, creds, allow_insecure=allow_insecure) as client:
                 result = client.execute(act, params)
         else:
-            with ConnectorClient(c, creds, base_url=base_url) as client:
+            with ConnectorClient(c, creds, base_url=base_url,
+                                 allow_insecure=allow_insecure) as client:
                 if paginate:
                     result = list(client.paginate(act, params, max_pages=max_pages))
                 else:

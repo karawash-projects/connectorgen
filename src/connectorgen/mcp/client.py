@@ -31,6 +31,7 @@ from ..errors import (
 )
 from ..ir import Action, Connector
 from ..runtime.auth import Credentials, apply_auth, pick_scheme
+from ..runtime.urls import insecure_http, install_log_redaction, register_secret_param
 from ..limits import BoundedValidator, SchemaTooLarge
 
 CLIENT_NAME = "connectorgen"
@@ -45,7 +46,7 @@ def _require_sdk() -> Any:
 
 
 def _target(connector: Connector, credentials: Credentials | None,
-            env: dict[str, str] | None) -> tuple[Any, Any]:
+            env: dict[str, str] | None, *, allow_insecure: bool = False) -> tuple[Any, Any]:
     """(what to pass to mcp.Client, an http client to close afterwards or None)."""
     _require_sdk()
     cfg = connector.mcp
@@ -78,7 +79,15 @@ def _target(connector: Connector, credentials: Credentials | None,
     headers = dict(cfg.headers)
     query: dict[str, Any] = {}
     cookies: dict[str, str] = {}
-    apply_auth(pick_scheme(connector.auth, credentials), credentials, headers, query, cookies)
+    scheme = pick_scheme(connector.auth, credentials)
+    apply_auth(scheme, credentials, headers, query, cookies)
+    if (query or cookies or headers != dict(cfg.headers)) and insecure_http(cfg.url) \
+            and not allow_insecure:
+        raise ConnectorError(f"Refusing to send credentials over plain http to {cfg.url}; use "
+                             "https or pass allow_insecure=True.")
+    if scheme is not None and scheme.type == "api_key" and scheme.location == "query":
+        register_secret_param(scheme.param_name)
+    install_log_redaction()
     if cookies:
         headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
     url = cfg.url
@@ -126,8 +135,10 @@ class AsyncMcpClient:
         validate: bool = True,
         validate_responses: Literal["off", "warn", "raise"] = "off",
         timeout: float = 120.0,
+        allow_insecure: bool = False,
     ):
         """
+        allow_insecure: send credentials to an http:// server that isn't on this machine.
         env: values for the connector's `env_passthrough` names (stdio servers);
             falls back to the process environment.
         server: connect to this instead of the configured server (an in-process
@@ -140,6 +151,7 @@ class AsyncMcpClient:
         self.validate = validate
         self.validate_responses = validate_responses
         self.timeout = timeout
+        self.allow_insecure = allow_insecure
         self._stack: AsyncExitStack | None = None
         self._client: Any = None
         self._validators: dict[str, BoundedValidator] = {}
@@ -151,7 +163,8 @@ class AsyncMcpClient:
             if self.server is not None:
                 target, http = self.server, None
             else:
-                target, http = _target(self.connector, self.credentials, self.env)
+                target, http = _target(self.connector, self.credentials, self.env,
+                                       allow_insecure=self.allow_insecure)
             if http is not None:
                 await stack.enter_async_context(http)
             info = mcp.types.Implementation(name=CLIENT_NAME, version="0.9")

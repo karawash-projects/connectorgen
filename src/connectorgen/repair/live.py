@@ -170,6 +170,10 @@ def _reconcile(spec: Any, obs: Any, path: str, changes: list[str]) -> Any:
                     props[k] = _lenient(sub)
                     changes.append(f"{path}.{k}: new field ({'/'.join(_types(sub)) or 'mixed'})")
             spec["properties"] = props
+            if isinstance(obs.get("additionalProperties"), dict) \
+                    and spec.get("additionalProperties") is False:
+                spec["additionalProperties"] = _lenient(obs["additionalProperties"])
+                changes.append(f"{path}: also has keys that are data (ids, emails, dates)")
             required = list(spec.get("required") or [])
             present = set(obs.get("required") or [])
             missing = [r for r in required if r not in present]

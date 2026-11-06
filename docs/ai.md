@@ -18,8 +18,11 @@ Choose a model with `--model provider:model` (or set `CONNECTORGEN_MODEL`) and s
 | `my-model --llm-base-url http://host:8000/v1` | Any OpenAI-compatible server (vLLM, LiteLLM, …) | `CONNECTORGEN_LLM_API_KEY` if needed |
 
 A provider's own key is only sent to that provider's own endpoint: with `--llm-base-url`
-pointing elsewhere, `OPENAI_API_KEY` and friends are ignored and only
-`CONNECTORGEN_LLM_API_KEY` (or `api_key=` in code) is used.
+pointing elsewhere (an OpenAI-compatible server, or an Anthropic-compatible gateway with
+`anthropic:`), `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and friends are ignored and only
+`CONNECTORGEN_LLM_API_KEY` (or `api_key=` in code) is used. `CONNECTORGEN_LLM_API_KEY` is
+never sent to a provider's own endpoint. Keys aren't sent over plain `http://` except to
+this machine (`allow_insecure=True` overrides that in code).
 
 Providers differ in structured-output support, so connectorgen asks for strict JSON Schema
 output first and steps down automatically (JSON Schema → JSON mode → schema in the prompt).

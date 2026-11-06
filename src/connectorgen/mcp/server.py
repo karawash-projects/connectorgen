@@ -87,6 +87,7 @@ def build_mcp_server(
     allow_destructive: bool = False,
     client: Any = None,
     base_url: str | None = None,
+    allow_insecure: bool = False,
 ) -> Any:
     """An mcp low-level Server whose tools are the connector's actions.
     `client` defaults to open_client(connector, credentials)."""
@@ -107,7 +108,9 @@ def build_mcp_server(
     tools = [tool_for_action(connector, a) for a in exposed]
     structured = {tool.name: tool.output_schema is not None for tool in tools}
     if client is None:
-        extra = {"base_url": base_url} if base_url and connector.mcp is None else {}
+        extra: dict[str, Any] = {"allow_insecure": allow_insecure}
+        if base_url and connector.mcp is None:
+            extra["base_url"] = base_url
         client = open_client(connector, credentials, **extra)
 
     async def on_list_tools(ctx: Any, params: Any) -> Any:

@@ -15,7 +15,17 @@ from ..limits import BoundedValidator, SchemaTooLarge
 
 
 _CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,39}$")
+_FIELD_NAME = re.compile(r"^[A-Za-z_$@][A-Za-z0-9_.$:-]{0,63}$")
+_DATA_HINTS = re.compile(r"@.*\.|^[0-9a-f]{8}-[0-9a-f]{4}-|\d{4,}", re.I)
 MAX_ITEMS = 25
+MAX_FIELDS = 100  # more keys than this: a map of data, not a record with named fields
+
+
+def data_like_key(key: str) -> bool:
+    """A key that is data rather than a field name: an email, a UUID, a number, a date, a
+    phrase. Observations keep such keys out (they can be personal data) and treat the
+    object as a map instead."""
+    return not _FIELD_NAME.match(key) or bool(_DATA_HINTS.search(key))
 
 
 def _type(value: Any) -> str:
@@ -47,9 +57,23 @@ def infer_shape(value: Any, depth: int = 8) -> dict[str, Any]:
     if t == "object":
         if depth <= 0:
             return {"type": "object"}
-        return {"type": "object",
-                "properties": {str(k): infer_shape(v, depth - 1) for k, v in value.items()},
-                "required": sorted(str(k) for k in value)}
+        if len(value) > MAX_FIELDS:
+            named: dict[str, Any] = {}
+            mapped = list(value.values())
+        else:
+            named = {str(k): v for k, v in value.items() if not data_like_key(str(k))}
+            mapped = [v for k, v in value.items() if data_like_key(str(k))]
+        shape: dict[str, Any] = {
+            "type": "object",
+            "properties": {k: infer_shape(v, depth - 1) for k, v in named.items()},
+            "required": sorted(named)}
+        if mapped:  # keys not kept: describe the values only
+            values: dict[str, Any] | None = None
+            for v in mapped[:MAX_ITEMS]:
+                s = infer_shape(v, depth - 1)
+                values = s if values is None else merge_shapes(values, s)
+            shape["additionalProperties"] = values or {}
+        return shape
     return {"type": t}
 
 
@@ -66,7 +90,13 @@ def merge_shapes(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
         props = {k: merge_shapes(pa[k], pb[k]) if k in pa and k in pb else (pa.get(k) or pb[k])
                  for k in list(pa) + [k for k in pb if k not in pa]}
         req = sorted(set(a.get("required", [])) & set(b.get("required", [])))
-        return {"type": "object", "properties": props, "required": req}
+        merged: dict[str, Any] = {"type": "object", "properties": props, "required": req}
+        extra = [s for s in (a.get("additionalProperties"), b.get("additionalProperties"))
+                 if isinstance(s, dict)]
+        if extra:
+            merged["additionalProperties"] = extra[0] if len(extra) == 1 \
+                else merge_shapes(extra[0], extra[1])
+        return merged
     if ta == tb == ["array"]:
         if "items" in a and "items" in b:
             return {"type": "array", "items": merge_shapes(a["items"], b["items"])}

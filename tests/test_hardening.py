@@ -673,3 +673,120 @@ def test_docs_merge_keeps_one_set_of_names():  # M13
 def test_placeholder_only_paths_need_the_path_in_the_docs():  # L11
     assert not _grounded("/{id}", "nothing relevant here")
     assert _grounded("/{id}", "GET /{id} returns the item")
+
+
+# -- step 4: credentials -------------------------------------------------------------------------
+import logging  # noqa: E402
+import time  # noqa: E402
+
+from connectorgen.ir import OAuthFlow  # noqa: E402
+from connectorgen.runtime.oauth import FileTokenStore, OAuth2Session, OAuthError, TokenSet  # noqa: E402
+from connectorgen.runtime.urls import insecure_http  # noqa: E402
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("http://api.acme.test", True), ("http://10.0.0.5:8080", True), ("http://0.0.0.0", True),
+    ("https://api.acme.test", False), ("http://localhost:8000", False),
+    ("http://127.0.0.1", False), ("http://[::1]:9", False), ("http://dev.localhost", False)])
+def test_insecure_http(url, expected):
+    assert insecure_http(url) is expected
+
+
+def test_credentials_are_not_sent_over_plain_http():  # M5
+    auth = [AuthScheme(id="key", type="api_key", param_name="X-Key", location="header")]
+    act = Action(name="get", method="GET", path="/x")
+    c = Connector(name="t", base_url="http://api.acme.test", auth=auth, actions=[act])
+    with ConnectorClient(c, Credentials(api_key="K")) as cl, \
+            pytest.raises(ConnectorError, match="plain http"):
+        cl.build_request(act, {})
+    with ConnectorClient(c, Credentials(api_key="K"), allow_insecure=True) as cl:
+        assert cl.build_request(act, {}).headers["X-Key"] == "K"
+    with ConnectorClient(c, Credentials()) as cl:  # nothing secret to send
+        cl.build_request(act, {})
+    with ConnectorClient(c, Credentials(api_key="K"), base_url="http://127.0.0.1:9") as cl:
+        cl.build_request(act, {})
+
+
+def test_oauth_token_endpoint_must_be_https():  # M5
+    flow = OAuthFlow(flow="client_credentials", token_url="http://auth.acme.test/token")
+    with pytest.raises(OAuthError, match="plain http"):
+        OAuth2Session(flow, "id", "secret").fetch_client_credentials()
+
+
+def test_workers_sharing_a_token_file_reuse_a_rotated_token(tmp_path):  # M6
+    valid, n = {"rt0"}, [0]
+
+    def handler(req):
+        rt = dict(parse_qsl(req.content.decode())).get("refresh_token")
+        if rt not in valid:
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        valid.discard(rt)
+        n[0] += 1
+        valid.add(f"rt{n[0]}")
+        return httpx.Response(200, json={"access_token": f"at{n[0]}",
+                                         "refresh_token": f"rt{n[0]}", "expires_in": 3600})
+
+    path = tmp_path / "tok.json"
+    FileTokenStore(path).save(TokenSet("at0", "rt0", expires_at=time.time() - 10))
+    flow = OAuthFlow(flow="authorization_code", authorization_url="https://a.test/auth",
+                     token_url="https://a.test/token")
+
+    def worker():
+        return OAuth2Session(flow, "cid", store=FileTokenStore(path),
+                             http=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    w1, w2 = worker(), worker()
+    assert w1.access_token() == "at1"
+    assert w2.access_token() == "at1" and n[0] == 1  # picked up, not refreshed again
+    assert w2.access_token(force_refresh=True) == "at2"  # a 401 still refreshes
+
+
+def test_llm_key_goes_only_where_it_belongs(monkeypatch):  # M17, M18
+    from connectorgen.llm import llm_from_spec
+    from connectorgen.llm.base import LLMError
+    from connectorgen.llm.openai_compat import OpenAICompatibleLLM
+
+    monkeypatch.setenv("CONNECTORGEN_LLM_API_KEY", "gateway-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router-key")
+    assert llm_from_spec("openrouter:x/y").api_key == "router-key"
+    assert llm_from_spec("m", base_url="https://gw.acme.test/v1").api_key == "gateway-key"
+    with pytest.raises(LLMError, match="plain http"):
+        llm_from_spec("m", base_url="http://gw.acme.test/v1")
+    pytest.importorskip("anthropic")
+    llm = llm_from_spec("anthropic:claude-x", base_url="https://gw.acme.test/v1")
+    assert str(llm.client.base_url).startswith("https://gw.acme.test")
+    assert llm.client.api_key == "gateway-key"
+
+    shared = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    OpenAICompatibleLLM("m", provider=None, base_url="https://gw.acme.test/v1",
+                        api_key="sk-secret", http=shared)
+    assert "authorization" not in shared.headers
+
+
+def test_http_library_logs_are_redacted(caplog):  # M19
+    from connectorgen.runtime.urls import install_log_redaction, register_secret_param
+
+    class URL:  # stands in for another library's URL type
+        def __str__(self):
+            return "https://mcp.acme.test/mcp?api_key=SECRETKEY123"
+
+    register_secret_param("api_key")
+    install_log_redaction()
+    with caplog.at_level(logging.DEBUG):
+        for name in ("httpx2", "mcp.client.streamable_http"):
+            logging.getLogger(name).info("HTTP Request: POST %s", URL())
+            logging.getLogger(name).debug("Connecting to %s", str(URL()))
+    assert caplog.records and "SECRETKEY123" not in caplog.text
+
+
+def test_observations_keep_data_out():  # M23
+    from connectorgen.repair.observe import data_like_key, infer_shape
+
+    shape = infer_shape({"members": {"alice@example.com": 7, "2024-01-02": 1},
+                         "id": 1, "createdAt": "x"})
+    assert "alice" not in json.dumps(shape) and "2024" not in json.dumps(shape)
+    assert shape["properties"]["members"]["additionalProperties"] == {"type": "integer"}
+    assert set(shape["properties"]) == {"members", "id", "createdAt"}
+    assert all(data_like_key(k) for k in ("bob@corp.com", "12345", "two words",
+                                          "550e8400-e29b-41d4-a716-446655440000"))
+    assert not any(data_like_key(k) for k in ("id", "created_at", "user.name", "$type"))
